@@ -208,12 +208,17 @@ impl KvEventPublisher {
         let cancellation_token_clone = cancellation_token.clone();
         let local_indexer_clone = local_indexer.clone();
 
+        // Create block access metrics for recording Accessed events.
+        let block_access_metrics =
+            Some(super::metrics::BlockAccessMetrics::from_component(&component));
+
         if enable_local_indexer {
             // When local indexer is enabled, use the event plane directly.
             // EventPublisher handles transport selection (ZMQ or NATS) based on environment.
             // Durability is provided by the local indexer's event buffer.
             tracing::info!("Using event plane for KV event publishing (local_indexer mode)");
             let component_clone = component.clone();
+            let bam = block_access_metrics.clone();
             component.drt().runtime().secondary().spawn(async move {
                 let event_publisher =
                     match EventPublisher::for_component(&component_clone, KV_EVENT_SUBJECT).await {
@@ -230,6 +235,7 @@ impl KvEventPublisher {
                     cancellation_token_clone,
                     rx,
                     local_indexer_clone,
+                    bam,
                 )
                 .await
             });
@@ -244,6 +250,7 @@ impl KvEventPublisher {
                 std::time::Duration::from_secs(60), // 1 minute timeout
             );
 
+            let bam = block_access_metrics.clone();
             component.drt().runtime().secondary().spawn(async move {
                 if let Err(e) = nats_queue.connect().await {
                     tracing::error!("Failed to connect NatsQueue: {e}");
@@ -255,6 +262,7 @@ impl KvEventPublisher {
                     cancellation_token_clone,
                     rx,
                     local_indexer_clone,
+                    bam,
                 )
                 .await
             });
@@ -326,6 +334,7 @@ async fn start_event_processor<P: EventSink + Send + Sync + 'static>(
     cancellation_token: CancellationToken,
     mut rx: mpsc::UnboundedReceiver<KvCacheEvent>,
     local_indexer: Option<Arc<LocalKvIndexer>>,
+    block_access_metrics: Option<Arc<super::metrics::BlockAccessMetrics>>,
 ) {
     loop {
         tokio::select! {
@@ -338,6 +347,13 @@ async fn start_event_processor<P: EventSink + Send + Sync + 'static>(
                     tracing::debug!("Event processor channel closed.");
                     break;
                 };
+
+                // Record block access metrics if this is an Accessed event.
+                if let KvCacheEventData::Accessed(ref access_data) = event.data {
+                    if let Some(ref metrics) = block_access_metrics {
+                        metrics.record(access_data.num_cached, access_data.num_prefilled);
+                    }
+                }
 
                 // Encapsulate in a router event.
                 tracing::trace!("Event processor for worker_id {} processing event: {:?}", worker_id, event.data);
@@ -372,6 +388,7 @@ async fn start_event_processor_jetstream(
     cancellation_token: CancellationToken,
     mut rx: mpsc::UnboundedReceiver<KvCacheEvent>,
     local_indexer: Option<Arc<LocalKvIndexer>>,
+    block_access_metrics: Option<Arc<super::metrics::BlockAccessMetrics>>,
 ) {
     loop {
         tokio::select! {
@@ -384,6 +401,13 @@ async fn start_event_processor_jetstream(
                     tracing::debug!("Event processor channel closed.");
                     break;
                 };
+
+                // Record block access metrics if this is an Accessed event.
+                if let KvCacheEventData::Accessed(ref access_data) = event.data {
+                    if let Some(ref metrics) = block_access_metrics {
+                        metrics.record(access_data.num_cached, access_data.num_prefilled);
+                    }
+                }
 
                 // Encapsulate in a router event.
                 tracing::trace!("Event processor for worker_id {} processing event: {:?}", worker_id, event.data);
@@ -641,6 +665,30 @@ fn convert_event(
             data: KvCacheEventData::Cleared,
             dp_rank,
         },
+        RawKvEvent::BlockAccessed {
+            block_hashes,
+            request_id,
+            num_cached,
+            num_prefilled,
+            cached_mask,
+            medium_per_block: _,
+        } => {
+            let hashes: Vec<ExternalSequenceBlockHash> = block_hashes
+                .into_iter()
+                .map(|bh| ExternalSequenceBlockHash::from(bh.into_u64()))
+                .collect();
+            KvCacheEvent {
+                event_id,
+                data: KvCacheEventData::Accessed(KvCacheAccessData {
+                    block_hashes: hashes,
+                    request_id,
+                    num_cached,
+                    num_prefilled,
+                    cached_mask,
+                }),
+                dp_rank,
+            }
+        }
     }
 }
 
@@ -786,6 +834,15 @@ enum RawKvEvent {
         medium: Option<String>,
     },
     AllBlocksCleared,
+    BlockAccessed {
+        block_hashes: Vec<BlockHashValue>,
+        request_id: String,
+        num_cached: u32,
+        num_prefilled: u32,
+        cached_mask: Vec<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        medium_per_block: Vec<Option<String>>,
+    },
 }
 
 /// Parse MM hash from extra_keys string:
@@ -878,6 +935,11 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
         let mut lora_name: Option<Option<String>> = None;
         let mut extra_keys: Option<Option<Vec<Option<Vec<String>>>>> = None;
         let mut block_mm_infos: Option<Option<Vec<Option<BlockExtraInfo>>>> = None;
+        let mut request_id: Option<String> = None;
+        let mut num_cached: Option<u32> = None;
+        let mut num_prefilled: Option<u32> = None;
+        let mut cached_mask: Option<Vec<bool>> = None;
+        let mut medium_per_block: Option<Vec<Option<String>>> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -907,6 +969,21 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 }
                 "block_mm_infos" => {
                     block_mm_infos = Some(map.next_value()?);
+                }
+                "request_id" => {
+                    request_id = Some(map.next_value()?);
+                }
+                "num_cached" => {
+                    num_cached = Some(map.next_value()?);
+                }
+                "num_prefilled" => {
+                    num_prefilled = Some(map.next_value()?);
+                }
+                "cached_mask" => {
+                    cached_mask = Some(map.next_value()?);
+                }
+                "medium_per_block" => {
+                    medium_per_block = Some(map.next_value()?);
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -943,9 +1020,29 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 })
             }
             Some("AllBlocksCleared") => Ok(RawKvEvent::AllBlocksCleared),
+            Some("BlockAccessed") => {
+                let block_hashes =
+                    block_hashes.ok_or_else(|| de::Error::missing_field("block_hashes"))?;
+                let request_id =
+                    request_id.ok_or_else(|| de::Error::missing_field("request_id"))?;
+                let num_cached =
+                    num_cached.ok_or_else(|| de::Error::missing_field("num_cached"))?;
+                let num_prefilled =
+                    num_prefilled.ok_or_else(|| de::Error::missing_field("num_prefilled"))?;
+                let cached_mask =
+                    cached_mask.ok_or_else(|| de::Error::missing_field("cached_mask"))?;
+                Ok(RawKvEvent::BlockAccessed {
+                    block_hashes,
+                    request_id,
+                    num_cached,
+                    num_prefilled,
+                    cached_mask,
+                    medium_per_block: medium_per_block.unwrap_or_default(),
+                })
+            }
             Some(other) => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared"],
+                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "BlockAccessed"],
             )),
             None => Err(de::Error::missing_field("type")),
         }
@@ -1016,9 +1113,39 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(RawKvEvent::AllBlocksCleared)
             }
+            "BlockAccessed" => {
+                let block_hashes: Vec<BlockHashValue> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &"missing block_hashes"))?;
+                let request_id: String = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &"missing request_id"))?;
+                let num_cached: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &"missing num_cached"))?;
+                let num_prefilled: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(4, &"missing num_prefilled"))?;
+                let cached_mask: Vec<bool> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(5, &"missing cached_mask"))?;
+                let medium_per_block: Vec<Option<String>> =
+                    seq.next_element()?.unwrap_or_default();
+
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+
+                Ok(RawKvEvent::BlockAccessed {
+                    block_hashes,
+                    request_id,
+                    num_cached,
+                    num_prefilled,
+                    cached_mask,
+                    medium_per_block,
+                })
+            }
             other => Err(de::Error::unknown_variant(
                 other,
-                &["BlockStored", "BlockRemoved", "AllBlocksCleared"],
+                &["BlockStored", "BlockRemoved", "AllBlocksCleared", "BlockAccessed"],
             )),
         }
     }
@@ -1580,7 +1707,7 @@ mod tests_startup_helpers {
         tx.send(event).unwrap();
         drop(tx);
 
-        let handle = tokio::spawn(start_event_processor(component, 1, token, rx, None));
+        let handle = tokio::spawn(start_event_processor(component, 1, token, rx, None, None));
 
         tokio::time::timeout(tokio::time::Duration::from_secs(1), handle)
             .await
@@ -1637,6 +1764,7 @@ mod tests_startup_helpers {
             token.clone(),
             rx,
             Some(local_indexer.clone()), // arc::clone just increments atomic counters
+            None,
         ));
 
         // Wait for processing
@@ -1720,6 +1848,7 @@ mod tests_startup_helpers {
             token.clone(),
             rx,
             Some(local_indexer.clone()),
+            None,
         ));
 
         // Then remove same event
@@ -1810,6 +1939,7 @@ mod tests_startup_helpers {
             token.clone(),
             rx,
             Some(local_indexer.clone()),
+            None,
         ));
 
         tokio::time::timeout(tokio::time::Duration::from_secs(1), handle)
@@ -1879,6 +2009,7 @@ mod tests_startup_helpers {
             new_token,
             rx,
             Some(local_indexer),
+            None,
         ));
 
         tokio::time::timeout(tokio::time::Duration::from_secs(1), handle)
@@ -2005,6 +2136,7 @@ mod tests_startup_helpers {
             token.clone(),
             worker_rx,
             Some(local_indexer_1.clone()),
+            None,
         ));
 
         // === SETUP: Router Components ===

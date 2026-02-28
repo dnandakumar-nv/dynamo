@@ -148,6 +148,25 @@ class kvbm:
     OBJECT_WRITE_FAILURES = "object_write_failures"
 
 
+class block_access:
+    """Block access metrics emitted by the KV indexer when processing BlockAccessed events."""
+
+    # Total blocks served from cache across all requests (counter).
+    BLOCKS_CACHED_TOTAL = "blocks_cached_total"
+    # Total blocks freshly prefilled across all requests (counter).
+    BLOCKS_PREFILLED_TOTAL = "blocks_prefilled_total"
+    # Per-request cache efficiency ratio (histogram, 0.0-1.0).
+    REQUEST_CACHE_EFFICIENCY = "request_cache_efficiency"
+    # Total BlockAccessed events processed (counter).
+    ACCESS_EVENTS_TOTAL = "access_events_total"
+    # Total miss blocks caused by routing to wrong worker (counter).
+    MISSES_ROUTING_TOTAL = "misses_routing_total"
+    # Total miss blocks caused by eviction from cache (counter).
+    MISSES_EVICTION_TOTAL = "misses_eviction_total"
+    # Total miss blocks that were never seen / cold (counter).
+    MISSES_COLD_TOTAL = "misses_cold_total"
+
+
 class kvrouter:
     # Number of KV cache events applied to the index (including status)
     KV_CACHE_EVENTS_APPLIED = "kv_cache_events_applied"

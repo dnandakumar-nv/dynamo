@@ -299,13 +299,68 @@ pub struct KvCacheEvent {
 
 /// Represents the data associated with a cache event.
 ///
-/// Data is either stored or removed.
+/// Variants:
+/// - [`Stored`](Self::Stored): New blocks have been added to the KV cache.
+/// - [`Removed`](Self::Removed): Blocks have been evicted from the KV cache.
+/// - [`Cleared`](Self::Cleared): All blocks have been removed (cache reset / worker restart).
+/// - [`Accessed`](Self::Accessed): Per-request cache hit/miss report (observability only;
+///   does not mutate the indexer's block state).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum KvCacheEventData {
     Stored(KvCacheStoreData),
     Removed(KvCacheRemoveData),
     Cleared,
+    /// Per-request block-level cache access report.
+    ///
+    /// Emitted once per prefill batch entry after the engine's prefix match
+    /// is finalized.  Unlike the other variants this is a pure observability
+    /// event -- the indexer does not add or remove blocks in response, but
+    /// uses it to record Prometheus metrics (see [`BlockAccessMetrics`] in
+    /// `lib/llm/src/kv_router/metrics.rs`).
+    ///
+    /// The block hashes use the same cumulative sequence-hash scheme as
+    /// [`KvCacheStoreData`], so they can be correlated with blocks already
+    /// tracked by the indexer.
+    Accessed(KvCacheAccessData),
+}
+
+/// Per-request data about which KV cache blocks were cache hits vs freshly
+/// prefilled.
+///
+/// Deserialized from the `BlockAccessed` event emitted by the inference engine
+/// (e.g. SGLang) and relayed through ZMQ -> Dynamo event plane -> NATS.
+///
+/// # Fields
+///
+/// * `block_hashes` -- Sequence block hashes for every block in this request's
+///   prefix, in order.  These are [`ExternalSequenceBlockHash`] values (the
+///   same cumulative hashes published by `Stored` events) so they can be
+///   joined with the indexer's stored-block state.
+///
+/// * `request_id` -- The engine-assigned unique identifier for the request.
+///
+/// * `num_cached` -- Number of blocks served from the KV cache (cache hits).
+///
+/// * `num_prefilled` -- Number of blocks that required fresh computation
+///   (cache misses).  Invariant: `num_cached + num_prefilled == block_hashes.len()`.
+///
+/// * `cached_mask` -- Boolean mask aligned 1:1 with `block_hashes`.  `true`
+///   at position *i* means block *i* was a cache hit.  The boundary between
+///   the `true` prefix and the `false` suffix corresponds to the engine's
+///   prefix-match length.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KvCacheAccessData {
+    /// Sequence block hashes for all blocks in this request's prefix.
+    pub block_hashes: Vec<ExternalSequenceBlockHash>,
+    /// Engine-assigned unique identifier for the request.
+    pub request_id: String,
+    /// Number of blocks served from cache (hits).
+    pub num_cached: u32,
+    /// Number of blocks freshly prefilled (misses).
+    pub num_prefilled: u32,
+    /// Per-block cache hit (`true`) / miss (`false`) mask, aligned with `block_hashes`.
+    pub cached_mask: Vec<bool>,
 }
 
 /// Represents the data associated with a stored cache event.

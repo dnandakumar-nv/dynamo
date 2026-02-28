@@ -84,6 +84,9 @@ impl NaiveNestedMapInner {
             KvCacheEventData::Cleared => {
                 self.index.remove(&worker);
             }
+            KvCacheEventData::Accessed(_) => {
+                // BlockAccessed is informational only; no-op.
+            }
         }
     }
 
@@ -292,6 +295,9 @@ impl InvertedIndexInner {
             }
             KvCacheEventData::Cleared => {
                 self.clear_worker(worker);
+            }
+            KvCacheEventData::Accessed(_) => {
+                // BlockAccessed is informational only; no-op.
             }
         }
     }

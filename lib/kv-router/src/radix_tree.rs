@@ -25,6 +25,77 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::protocols::*;
 
+// ---------------------------------------------------------------------------
+// Miss classification types
+// ---------------------------------------------------------------------------
+
+/// Result of classifying per-block cache misses in a BlockAccessed event.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MissClassification {
+    /// Blocks that were cache hits.
+    pub hits: u32,
+    /// Blocks that exist on another worker but not the one that served the request.
+    pub routing_misses: u32,
+    /// Blocks recently evicted from cache (seen in eviction history).
+    pub eviction_misses: u32,
+    /// Blocks never seen on any worker.
+    pub cold_misses: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Eviction history (bounded FIFO set)
+// ---------------------------------------------------------------------------
+
+/// Bounded FIFO set tracking recently removed block hashes for miss classification.
+///
+/// When a block is removed from any worker, its hash is inserted here.
+/// When a block is re-stored, its hash is removed (prevents stale classifications).
+/// When capacity is exceeded, the oldest entry is evicted.
+pub struct EvictionHistory {
+    set: FxHashSet<ExternalSequenceBlockHash>,
+    order: VecDeque<ExternalSequenceBlockHash>,
+    capacity: usize,
+}
+
+/// Default capacity for eviction history: 100K entries (~800KB).
+pub const DEFAULT_EVICTION_HISTORY_CAPACITY: usize = 100_000;
+
+impl EvictionHistory {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            set: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Record a block hash as recently evicted.
+    pub fn insert(&mut self, hash: ExternalSequenceBlockHash) {
+        if self.set.contains(&hash) {
+            return; // already tracked
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        self.set.insert(hash);
+        self.order.push_back(hash);
+    }
+
+    /// Check if a block hash was recently evicted.
+    pub fn contains(&self, hash: &ExternalSequenceBlockHash) -> bool {
+        self.set.contains(hash)
+    }
+
+    /// Remove a block hash from eviction history (e.g., when re-stored).
+    pub fn remove(&mut self, hash: &ExternalSequenceBlockHash) {
+        self.set.remove(hash);
+        // Note: we don't remove from `order` (O(n)); the entry will be
+        // silently skipped when it reaches the front during capacity eviction.
+    }
+}
+
 /// A shared reference to a [`RadixBlock`].
 pub(crate) type SharedRadixBlock = Rc<RefCell<RadixBlock>>;
 
@@ -84,6 +155,9 @@ pub struct RadixTree {
 
     /// The time buffer the radix tree should check when considering frequence of block accesses
     pub(crate) expiration_duration: Option<Duration>,
+
+    /// Bounded set of recently-removed block hashes for miss classification.
+    pub(crate) eviction_history: EvictionHistory,
 }
 
 impl Default for RadixTree {
@@ -136,6 +210,7 @@ impl RadixTree {
             root: Rc::new(RefCell::new(RadixBlock::new())),
             lookup: FxHashMap::default(),
             expiration_duration,
+            eviction_history: EvictionHistory::new(DEFAULT_EVICTION_HISTORY_CAPACITY),
         }
     }
 
@@ -332,7 +407,12 @@ impl RadixTree {
         let worker_lookup = self.lookup.entry(worker).or_default();
 
         match op {
-            KvCacheEventData::Stored(op) => {
+            KvCacheEventData::Stored(ref op) => {
+                // Remove re-stored block hashes from eviction history
+                for block_data in &op.blocks {
+                    self.eviction_history.remove(&block_data.block_hash);
+                }
+
                 // find the parent block from this worker's lookup
                 let mut current = match op.parent_hash {
                     Some(parent) => match worker_lookup.get(&parent) {
@@ -357,7 +437,7 @@ impl RadixTree {
                 // In each iteration we lock the parent and insert the worker
                 // deferred from the previous iteration, avoiding a second
                 // borrow on the same block.
-                for block_data in op.blocks {
+                for block_data in &op.blocks {
                     let mut parent_mut = current.borrow_mut();
 
                     if needs_worker_insert {
@@ -423,9 +503,9 @@ impl RadixTree {
             }
             KvCacheEventData::Removed(remove) => {
                 let mut kv_cache_err: Option<KvCacheEventError> = None;
-                for block in remove.block_hashes {
+                for block in &remove.block_hashes {
                     // lookup block in worker's table
-                    let entry = match worker_lookup.get(&block) {
+                    let entry = match worker_lookup.get(block) {
                         Some(entry) => entry.clone(),
                         None => {
                             tracing::warn!(
@@ -450,14 +530,26 @@ impl RadixTree {
                     if guard.workers.is_empty() {
                         // if no workers are using this block, that is true for all children
                         guard.children.clear();
+                        // Track in eviction history (block gone from all workers)
+                        self.eviction_history.insert(*block);
                     }
                     // remove the block from the worker's lookup table
-                    worker_lookup.remove(&block);
+                    worker_lookup.remove(block);
                 }
                 kv_cache_err.map_or(Ok(()), Err)
             }
             KvCacheEventData::Cleared => {
                 self.clear_all_blocks(worker.worker_id);
+                Ok(())
+            }
+            KvCacheEventData::Accessed(access_data) => {
+                tracing::trace!(
+                    request_id = %access_data.request_id,
+                    num_cached = access_data.num_cached,
+                    num_prefilled = access_data.num_prefilled,
+                    total_blocks = access_data.block_hashes.len(),
+                    "BlockAccessed event (no tree mutation)"
+                );
                 Ok(())
             }
         }
@@ -569,6 +661,45 @@ impl RadixTree {
         }
 
         events
+    }
+
+    /// Classify each missed block in a BlockAccessed event.
+    ///
+    /// For each block where `cached_mask[i] == false`:
+    /// - If the block exists on another worker → routing miss
+    /// - If the block was recently evicted (in eviction history) → eviction miss
+    /// - Otherwise → cold miss (never seen)
+    pub fn classify_access_event(
+        &self,
+        worker: WorkerWithDpRank,
+        access_data: &KvCacheAccessData,
+    ) -> MissClassification {
+        let mut result = MissClassification::default();
+
+        for (i, &is_cached) in access_data.cached_mask.iter().enumerate() {
+            if is_cached {
+                result.hits += 1;
+                continue;
+            }
+
+            let block_hash = &access_data.block_hashes[i];
+
+            // Check if block exists on any other worker
+            let exists_on_other = self
+                .lookup
+                .iter()
+                .any(|(w, blocks)| *w != worker && blocks.contains_key(block_hash));
+
+            if exists_on_other {
+                result.routing_misses += 1;
+            } else if self.eviction_history.contains(block_hash) {
+                result.eviction_misses += 1;
+            } else {
+                result.cold_misses += 1;
+            }
+        }
+
+        result
     }
 
     pub fn current_size(&self) -> usize {

@@ -481,6 +481,31 @@ pub mod kvrouter {
     pub const KV_CACHE_EVENTS_APPLIED: &str = "kv_cache_events_applied";
 }
 
+/// Block access metrics emitted by the KV indexer when processing BlockAccessed events.
+///
+/// These counters and histogram track how many blocks were served from cache vs freshly
+/// prefilled, giving visibility into cache efficiency at the block level.
+///
+/// Metric names are combined with `name_prefix::FRONTEND` ("dynamo_frontend") to form
+/// the full name, e.g. `dynamo_frontend_block_access_blocks_cached_total`.
+/// See `lib/llm/src/kv_router/metrics.rs` `BlockAccessMetrics::from_component()`.
+pub mod block_access {
+    /// Total blocks served from cache across all requests (counter).
+    pub const BLOCKS_CACHED_TOTAL: &str = "blocks_cached_total";
+    /// Total blocks freshly prefilled across all requests (counter).
+    pub const BLOCKS_PREFILLED_TOTAL: &str = "blocks_prefilled_total";
+    /// Per-request cache efficiency ratio (histogram, 0.0-1.0).
+    pub const REQUEST_CACHE_EFFICIENCY: &str = "request_cache_efficiency";
+    /// Total BlockAccessed events processed (counter).
+    pub const ACCESS_EVENTS_TOTAL: &str = "access_events_total";
+    /// Total miss blocks caused by routing to wrong worker (counter).
+    pub const MISSES_ROUTING_TOTAL: &str = "misses_routing_total";
+    /// Total miss blocks caused by eviction from cache (counter).
+    pub const MISSES_EVICTION_TOTAL: &str = "misses_eviction_total";
+    /// Total miss blocks that were never seen / cold (counter).
+    pub const MISSES_COLD_TOTAL: &str = "misses_cold_total";
+}
+
 // KV cache statistics metrics
 pub mod kvstats {
     /// Total number of KV cache blocks available on the worker

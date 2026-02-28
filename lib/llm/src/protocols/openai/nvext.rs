@@ -199,6 +199,32 @@ pub struct AgentHints {
     #[builder(default, setter(strip_option))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+
+    /// Cache lifecycle action to perform on this request's KV blocks after
+    /// generation completes. The action targets the blocks identified by
+    /// the request's tokenized prompt on the routed worker.
+    ///
+    /// Supported values:
+    /// - `"demote_to_host"`: GPU → host memory (fast H2D reload on next hit)
+    /// - `"demote_to_storage"`: host → storage backend (cold archival)
+    /// - `"evict"`: remove from all tiers
+    /// - `"promote"`: pre-warm from host → GPU before generation
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_action: Option<String>,
+
+    /// Prefix ownership identifier for cache-aware eviction.
+    ///
+    /// When set, the scheduler tracks which agents own which tree nodes.
+    /// During eviction/demotion, only nodes exclusively owned by this
+    /// prefix_id are affected; shared nodes (referenced by multiple
+    /// prefix_ids) are preserved.
+    ///
+    /// When absent, eviction falls back to the default behavior
+    /// (evict the entire subtree).
+    #[builder(default, setter(strip_option))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_id: Option<String>,
 }
 
 /// Anthropic-style cache control hint for prefix pinning with TTL.
@@ -424,5 +450,53 @@ mod tests {
         assert_eq!(result.decode_worker_id, Some(123));
         // prefill_worker_id should remain from original nvext (not overwritten by header)
         assert_eq!(result.prefill_worker_id, Some(777));
+    }
+
+    #[test]
+    fn test_cache_action_deserialize() {
+        let json = r#"{"cache_action": "demote_to_host"}"#;
+        let hints: AgentHints = serde_json::from_str(json).unwrap();
+        assert_eq!(hints.cache_action.as_deref(), Some("demote_to_host"));
+    }
+
+    #[test]
+    fn test_cache_action_with_existing_fields() {
+        let json = r#"{"latency_sensitivity": 5.0, "osl": 512, "cache_action": "evict"}"#;
+        let hints: AgentHints = serde_json::from_str(json).unwrap();
+        assert_eq!(hints.latency_sensitivity, Some(5.0));
+        assert_eq!(hints.osl, Some(512));
+        assert_eq!(hints.cache_action.as_deref(), Some("evict"));
+    }
+
+    #[test]
+    fn test_backward_compatible_no_cache_action() {
+        let json = r#"{"latency_sensitivity": 3.0}"#;
+        let hints: AgentHints = serde_json::from_str(json).unwrap();
+        assert!(hints.cache_action.is_none());
+    }
+
+    #[test]
+    fn test_empty_hints_serialize_to_empty_object() {
+        let hints = AgentHints::default();
+        let json = serde_json::to_string(&hints).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn test_cache_action_roundtrip() {
+        let hints = AgentHints {
+            cache_action: Some("demote_to_host".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&hints).unwrap();
+        let parsed: AgentHints = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cache_action, hints.cache_action);
+    }
+
+    #[test]
+    fn test_unknown_action_passthrough() {
+        let json = r#"{"cache_action": "future_action"}"#;
+        let hints: AgentHints = serde_json::from_str(json).unwrap();
+        assert_eq!(hints.cache_action.as_deref(), Some("future_action"));
     }
 }

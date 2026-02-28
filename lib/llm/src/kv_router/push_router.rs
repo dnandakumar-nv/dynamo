@@ -19,14 +19,17 @@ use tracing::Instrument;
 use crate::{
     kv_router::{
         CacheControlClient, KvRouter,
-        cache_control::{PinState, create_cache_control_client, spawn_pin_prefix},
+        cache_control::{CacheActionState, PinState, create_cache_control_client, spawn_cache_action, spawn_pin_prefix, spawn_register_owner},
         metrics::RouterRequestMetrics,
         protocols::{TokensWithHashes, WorkerWithDpRank},
     },
     preprocessor::PreprocessedRequest,
-    protocols::common::{
-        llm_backend::LLMEngineOutput,
-        timing::{RequestPhase, RequestTracker},
+    protocols::{
+        TokenIdType,
+        common::{
+            llm_backend::LLMEngineOutput,
+            timing::{RequestPhase, RequestTracker},
+        },
     },
 };
 
@@ -67,6 +70,12 @@ struct RequestGuard {
     expected_output_tokens: Option<u32>,
     // PIN state: set when cache_control TTL is present and a cc_client exists
     pin_state: Option<PinState>,
+    // Cache lifecycle action: set when agent_hints.cache_action is present and a cc_client exists
+    cache_action: Option<CacheActionState>,
+    // Prefix ownership: when prefix_id is set, register_owner is sent after generation
+    prefix_id: Option<String>,
+    register_client: Option<(CacheControlClient, u64)>,
+    token_ids: Vec<TokenIdType>,
 }
 
 impl RequestGuard {
@@ -151,6 +160,25 @@ impl RequestGuard {
                 &self.context_id,
                 pin.ttl_seconds,
             );
+        }
+
+        // Cache lifecycle action from agent_hints
+        if let Some(ref action_state) = self.cache_action {
+            spawn_cache_action(
+                &action_state.cc_client,
+                &action_state.action,
+                &action_state.token_ids,
+                action_state.instance_id,
+                &self.context_id,
+                action_state.prefix_id.as_deref(),
+            );
+        }
+
+        // Register prefix ownership on the worker's radix tree
+        if let (Some(pid), Some((client, inst_id))) =
+            (&self.prefix_id, &self.register_client)
+        {
+            spawn_register_owner(client, &self.token_ids, *inst_id, pid, &self.context_id);
         }
     }
 
@@ -473,6 +501,86 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
         }
         .await;
 
+        // Extract cache_action state: reuses the same cache_control client as PIN
+        let cache_action: Option<CacheActionState> = async {
+            let action = request
+                .routing
+                .as_ref()
+                .and_then(|r| r.cache_action.as_ref())?
+                .clone();
+
+            // "promote" is handled pre-generation (below), not post-generation
+            if action == "promote" {
+                return None;
+            }
+
+            let cell = self.cache_control_cell.as_ref()?;
+            let component = self.chooser.client().endpoint.component().clone();
+            let client = cell
+                .get_or_try_init(|| create_cache_control_client(&component))
+                .await
+                .inspect_err(|e| tracing::warn!("Failed to create cache_control client: {e}"))
+                .ok()?
+                .clone();
+
+            Some(CacheActionState {
+                action,
+                token_ids: request.token_ids.clone(),
+                cc_client: client,
+                instance_id,
+                prefix_id: request
+                    .routing
+                    .as_ref()
+                    .and_then(|r| r.prefix_id.clone()),
+            })
+        }
+        .await;
+
+        // Extract prefix_id for register_owner (independent of cache_action)
+        let prefix_id = request
+            .routing
+            .as_ref()
+            .and_then(|r| r.prefix_id.clone());
+        let register_client: Option<(CacheControlClient, u64)> = async {
+            let _ = prefix_id.as_ref()?;
+            let cell = self.cache_control_cell.as_ref()?;
+            let component = self.chooser.client().endpoint.component().clone();
+            let client = cell
+                .get_or_try_init(|| create_cache_control_client(&component))
+                .await
+                .inspect_err(|e| tracing::warn!("Failed to create cache_control client: {e}"))
+                .ok()?
+                .clone();
+            Some((client, instance_id))
+        }
+        .await;
+        let guard_token_ids = request.token_ids.clone();
+
+        // Pre-generation: handle "promote" cache_action before routing starts
+        if request
+            .routing
+            .as_ref()
+            .and_then(|r| r.cache_action.as_deref())
+            == Some("promote")
+        {
+            if let Some(cell) = self.cache_control_cell.as_ref() {
+                let component = self.chooser.client().endpoint.component().clone();
+                if let Ok(client) = cell
+                    .get_or_try_init(|| create_cache_control_client(&component))
+                    .await
+                {
+                    spawn_cache_action(
+                        client,
+                        "promote",
+                        &request.token_ids,
+                        instance_id,
+                        &context_id,
+                        prefix_id.as_deref(),
+                    );
+                }
+            }
+        }
+
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(dp_rank);
         let updated_request = context.map(|_| backend_input);
@@ -515,6 +623,10 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
                 block_size,
                 expected_output_tokens,
                 pin_state,
+                cache_action,
+                prefix_id,
+                register_client,
+                token_ids: guard_token_ids,
             };
 
             loop {

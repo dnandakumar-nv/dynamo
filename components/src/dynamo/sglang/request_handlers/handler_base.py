@@ -354,6 +354,84 @@ class BaseWorkerHandler(BaseGenerativeHandler):
             logging.error(f"Failed to pin prefix: {e}")
             return {"status": "error", "message": str(e)}
 
+    async def evict_prefix(self, body: dict) -> dict:
+        """Evict a prefix and its subtree from all cache tiers."""
+        token_ids = body.get("token_ids", [])
+        force = body.get("force", False)
+        prefix_id = body.get("prefix_id")
+        if not token_ids:
+            return {"status": "error", "message": "token_ids is required"}
+        try:
+            result = await self.engine.tokenizer_manager.evict_prefix(
+                token_ids, force, prefix_id=prefix_id
+            )
+            return {
+                "status": "ok" if result.success else "error",
+                "message": result.message,
+                "num_tokens_evicted": result.num_tokens_evicted,
+            }
+        except Exception as e:
+            logging.error(f"Failed to evict prefix: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def demote_prefix(self, body: dict) -> dict:
+        """Demote a prefix and its subtree to a lower cache tier."""
+        token_ids = body.get("token_ids", [])
+        target = body.get("target", "host")
+        prefix_id = body.get("prefix_id")
+        if not token_ids:
+            return {"status": "error", "message": "token_ids is required"}
+        try:
+            result = await self.engine.tokenizer_manager.demote_prefix(
+                token_ids, target, prefix_id=prefix_id
+            )
+            return {
+                "status": "ok" if result.success else "error",
+                "message": result.message,
+                "num_tokens_demoted": result.num_tokens_demoted,
+            }
+        except Exception as e:
+            logging.error(f"Failed to demote prefix: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def promote_prefix(self, body: dict) -> dict:
+        """Promote a prefix from host memory back to GPU."""
+        token_ids = body.get("token_ids", [])
+        if not token_ids:
+            return {"status": "error", "message": "token_ids is required"}
+        try:
+            result = await self.engine.tokenizer_manager.promote_prefix(token_ids)
+            return {
+                "status": "ok" if result.success else "error",
+                "message": result.message,
+                "num_tokens_promoted": result.num_tokens_promoted,
+            }
+        except Exception as e:
+            logging.error(f"Failed to promote prefix: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def register_prefix_owner(self, body: dict) -> dict:
+        """Register prefix ownership on cached tree nodes.
+
+        Stamps the given prefix_id on all radix tree nodes matching
+        the token_ids sequence, enabling prefix_id-aware eviction.
+        """
+        token_ids = body.get("token_ids", [])
+        prefix_id = body.get("prefix_id", "")
+        if not token_ids or not prefix_id:
+            return {"status": "error", "message": "token_ids and prefix_id required"}
+        try:
+            result = await self.engine.tokenizer_manager.register_prefix_owner(
+                token_ids, prefix_id
+            )
+            return {
+                "status": "ok" if result.success else "error",
+                "message": getattr(result, "message", ""),
+            }
+        except Exception as e:
+            logging.error(f"Failed to register prefix owner: {e}")
+            return {"status": "error", "message": str(e)}
+
     async def cache_control(self, request, context=None):
         """Service mesh endpoint for cache control operations.
 
@@ -367,6 +445,14 @@ class BaseWorkerHandler(BaseGenerativeHandler):
         action = request.get("action")
         if action == "pin_prefix":
             result = await self.pin_prefix(request)
+        elif action == "evict_prefix":
+            result = await self.evict_prefix(request)
+        elif action == "demote_prefix":
+            result = await self.demote_prefix(request)
+        elif action == "promote_prefix":
+            result = await self.promote_prefix(request)
+        elif action == "register_owner":
+            result = await self.register_prefix_owner(request)
         else:
             result = {"status": "error", "message": f"Unknown action: {action}"}
         yield result

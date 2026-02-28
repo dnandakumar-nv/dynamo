@@ -269,6 +269,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                         "total_tokens": input_tokens + completion_tokens,
                         "prompt_tokens_details": prefill_prompt_tokens_details,
                     }
+                if "block_cache_status" in res.get("meta_info", {}):
+                    # Pass through per-block cache status to the response
+                    out["block_cache_status"] = res["meta_info"]["block_cache_status"]
                 if not context.is_stopped():
                     yield out
 

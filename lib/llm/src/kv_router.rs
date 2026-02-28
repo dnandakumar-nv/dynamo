@@ -56,9 +56,9 @@ use crate::{
         approx::PruneConfig,
         indexer::{GetWorkersRequest, KvIndexer, KvIndexerInterface, KvRouterError},
         protocols::{
-            BlockExtraInfo, DpRank, LocalBlockHash, OverlapScores, RouterEvent, RouterRequest,
-            RouterResponse, TokensWithHashes, WorkerId, WorkerWithDpRank,
-            compute_block_hash_for_seq,
+            BlockExtraInfo, DpRank, KvCacheAccessData, LocalBlockHash, OverlapScores, RouterEvent,
+            RouterRequest, RouterResponse, TokensWithHashes, WorkerId, WorkerSelectionResult,
+            WorkerWithDpRank, compute_block_hash_for_seq,
         },
         scheduler::{KvScheduler, PotentialLoad},
         sequence::{SequenceError, SequenceRequest},
@@ -271,6 +271,33 @@ impl Indexer {
             }
             Indexer::Concurrent(tpi) => tpi.backend().get_workers(),
             Indexer::None => Vec::new(),
+        }
+    }
+
+    /// Classify miss reasons for a BlockAccessed event.
+    pub(crate) async fn classify_access_event(
+        &self,
+        worker: WorkerWithDpRank,
+        access_data: &KvCacheAccessData,
+    ) -> Option<dynamo_kv_router::radix_tree::MissClassification> {
+        match self {
+            Indexer::KvIndexer(indexer) => {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let req = indexer::ClassifyRequest {
+                    worker,
+                    access_data: access_data.clone(),
+                    resp: resp_tx,
+                };
+                if let Err(e) = indexer.classify_sender().send(req).await {
+                    tracing::warn!("Failed to send classify request: {e}");
+                    return None;
+                }
+                resp_rx.await.ok()
+            }
+            Indexer::Concurrent(tpi) => {
+                Some(tpi.backend().classify_access_event(worker, access_data))
+            }
+            Indexer::None => None,
         }
     }
 }

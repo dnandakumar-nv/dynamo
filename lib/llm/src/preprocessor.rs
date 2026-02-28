@@ -287,6 +287,8 @@ impl OpenAIPreprocessor {
                 lora_name,
                 cache_control_ttl: nvext.cache_control.as_ref().map(|cc| cc.ttl_seconds()),
                 allowed_worker_ids: None,
+                cache_action: hints.and_then(|h| h.cache_action.clone()),
+                prefix_id: hints.and_then(|h| h.prefix_id.clone()),
             };
             builder.routing(Some(routing));
         } else if lora_name.is_some() {
