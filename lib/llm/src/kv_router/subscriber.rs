@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use crate::kv_router::{
     Indexer, KV_EVENT_SUBJECT, KvRouterConfig,
-    protocols::{DpRank, RouterEvent, WorkerId},
+    metrics::BlockAccessMetrics,
+    protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId, WorkerWithDpRank},
     worker_query::WorkerQueryClient,
 };
 use anyhow::Result;
@@ -36,6 +37,9 @@ async fn start_kv_router_background_event_plane(
     // WorkerQueryClient handles its own discovery loop for lifecycle + initial recovery.
     // No blocking wait — recovery happens asynchronously as endpoints are discovered.
     let worker_query_client = WorkerQueryClient::spawn(component.clone(), indexer.clone()).await?;
+
+    // Initialize block access metrics (component-scoped, memoized via OnceLock)
+    let block_access_metrics = BlockAccessMetrics::from_component(&component);
 
     // Subscribe to KV events using the selected event plane transport
     let mut subscriber =
@@ -99,26 +103,47 @@ async fn start_kv_router_background_event_plane(
                         envelope.sequence
                     );
 
-                    // Gap detection: check if event ID is monotonically increasing per (worker, dp_rank)
-                    // Note: event_id <= last_id is duplicate/out-of-order, apply anyway (idempotent)
-                    if let Some(&last_id) = last_event_ids.get(&event_key)
-                        && event_id > last_id + 1
-                    {
-                        let gap_start = last_id + 1;
-                        let gap_end = event_id - 1;
-                        let gap_size = gap_end - gap_start + 1;
-                        tracing::warn!(
-                            "Event ID gap detected for worker {worker_id} dp_rank {dp_rank}, recovering events [{gap_start}, {gap_end}], gap_size: {gap_size}"
-                        );
-
-                        if let Err(e) = worker_query_client
-                            .recover_from_worker(worker_id, dp_rank, Some(gap_start), Some(gap_end))
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to recover gap events for worker {worker_id} dp_rank {dp_rank} (gap_start: {gap_start}, gap_end: {gap_end}); proceeding with current event anyway: {e}"
+                    // Gap detection: check if event ID is monotonically increasing per (worker, dp_rank).
+                    // In local_indexer mode, only Accessed events flow through the event plane;
+                    // Stored/Removed events stay local.  On the first event from a worker
+                    // (or after a gap), recover the missing Stored events so the global tree
+                    // is populated for miss classification.
+                    match last_event_ids.get(&event_key) {
+                        None if event_id > 1 => {
+                            // First event from this worker — recover everything before it
+                            let gap_end = event_id - 1;
+                            tracing::info!(
+                                "First event from worker {worker_id} dp_rank {dp_rank} has id {event_id}; \
+                                 recovering prior events [1, {gap_end}]"
                             );
+                            if let Err(e) = worker_query_client
+                                .recover_from_worker(worker_id, dp_rank, Some(1), Some(gap_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to recover prior events for worker {worker_id} dp_rank {dp_rank}: {e}"
+                                );
+                            }
                         }
+                        Some(&last_id) if event_id > last_id + 1 => {
+                            let gap_start = last_id + 1;
+                            let gap_end = event_id - 1;
+                            let gap_size = gap_end - gap_start + 1;
+                            tracing::warn!(
+                                "Event ID gap detected for worker {worker_id} dp_rank {dp_rank}, \
+                                 recovering events [{gap_start}, {gap_end}], gap_size: {gap_size}"
+                            );
+                            if let Err(e) = worker_query_client
+                                .recover_from_worker(worker_id, dp_rank, Some(gap_start), Some(gap_end))
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to recover gap events for worker {worker_id} dp_rank {dp_rank} \
+                                     (gap_start: {gap_start}, gap_end: {gap_end}): {e}"
+                                );
+                            }
+                        }
+                        _ => {} // No gap or first event with id=1
                     }
 
                     // Update last seen event ID (use max to handle out-of-order)
@@ -127,8 +152,22 @@ async fn start_kv_router_background_event_plane(
                         .and_modify(|id| *id = (*id).max(event_id))
                         .or_insert(event_id);
 
-                    // Forward the RouterEvent to the indexer
-                    indexer.apply_event(event).await;
+                    // Record block access metrics for BlockAccessed events
+                    if let KvCacheEventData::Accessed(ref access_data) = event.event.data {
+                        block_access_metrics.record(access_data.num_cached, access_data.num_prefilled);
+                    }
+
+                    // Forward the RouterEvent to the indexer (must happen before classify
+                    // so the tree has the latest state, though Accessed is a no-op mutation)
+                    indexer.apply_event(event.clone()).await;
+
+                    // Classify miss reasons using the global tree
+                    if let KvCacheEventData::Accessed(ref access_data) = event.event.data {
+                        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                        if let Some(classification) = indexer.classify_access_event(worker, access_data).await {
+                            block_access_metrics.record_classification(&classification);
+                        }
+                    }
                 }
             }
         }

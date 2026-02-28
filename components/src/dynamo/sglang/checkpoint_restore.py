@@ -28,6 +28,8 @@ Signals handled in checkpoint mode:
 - SIGKILL (from watcher on failure): Process is terminated immediately (unhandleable)
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os

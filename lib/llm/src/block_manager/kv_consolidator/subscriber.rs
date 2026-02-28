@@ -158,6 +158,19 @@ enum VllmRawEvent {
     },
     #[serde(rename = "AllBlocksCleared")]
     AllBlocksCleared {},
+    #[serde(rename = "BlockAccessed")]
+    BlockAccessed {
+        #[serde(default)]
+        block_hashes: Vec<BlockHash>,
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        num_cached: Option<u32>,
+        #[serde(default)]
+        num_prefilled: Option<u32>,
+        #[serde(default)]
+        cached_mask: Option<Vec<bool>>,
+    },
 }
 
 /// Start ZMQ listener and process events into tracker
@@ -407,6 +420,21 @@ fn process_event(
         VllmRawEvent::AllBlocksCleared {} => {
             tracing::debug!("Processing AllBlocksCleared");
             tracker.handle_clear_all();
+        }
+
+        VllmRawEvent::BlockAccessed {
+            block_hashes: _,
+            request_id,
+            num_cached,
+            num_prefilled,
+            cached_mask: _,
+        } => {
+            tracing::debug!(
+                "Processing BlockAccessed (no-op): request_id={:?}, num_cached={:?}, num_prefilled={:?}",
+                request_id,
+                num_cached,
+                num_prefilled,
+            );
         }
     }
 }

@@ -263,6 +263,10 @@ impl PositionalIndexer {
                 Self::clear_worker_blocks_impl(index, worker_blocks, worker_id);
                 Ok(())
             }
+            KvCacheEventData::Accessed(_) => {
+                // BlockAccessed is informational only; no index mutation needed.
+                Ok(())
+            }
         }
     }
 

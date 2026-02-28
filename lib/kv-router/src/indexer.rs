@@ -212,6 +212,7 @@ impl KvIndexerMetrics {
             KvCacheEventData::Stored(_) => METRIC_EVENT_STORED,
             KvCacheEventData::Removed(_) => METRIC_EVENT_REMOVED,
             KvCacheEventData::Cleared => METRIC_EVENT_CLEARED,
+            KvCacheEventData::Accessed(_) => "accessed",
         }
     }
 
@@ -279,6 +280,13 @@ pub struct DumpRequest {
 pub struct GetWorkersRequest {
     /// Channel to send the worker IDs
     pub resp: oneshot::Sender<Vec<WorkerId>>,
+}
+
+/// A request to classify miss reasons for a BlockAccessed event.
+pub struct ClassifyRequest {
+    pub worker: WorkerWithDpRank,
+    pub access_data: KvCacheAccessData,
+    pub resp: oneshot::Sender<crate::radix_tree::MissClassification>,
 }
 
 #[async_trait]
@@ -617,6 +625,8 @@ pub struct KvIndexer {
     dump_tx: mpsc::Sender<DumpRequest>,
     /// A sender for routing decision requests.
     routing_tx: mpsc::Sender<RoutingDecisionRequest>,
+    /// A sender for classify requests.
+    classify_tx: mpsc::Sender<ClassifyRequest>,
     /// The size of the KV block this indexer can handle.
     kv_block_size: u32,
     /// Reference counter for Clone-aware Drop.
@@ -650,6 +660,7 @@ impl KvIndexer {
         let (get_workers_tx, get_workers_rx) = mpsc::channel::<GetWorkersRequest>(16);
         let (dump_tx, dump_rx) = mpsc::channel::<DumpRequest>(16);
         let (routing_tx, mut routing_rx) = mpsc::channel::<RoutingDecisionRequest>(2048);
+        let (classify_tx, mut classify_rx) = mpsc::channel::<ClassifyRequest>(128);
         let (prune_tx, mut prune_rx) = mpsc::channel::<()>(1);
 
         let cancel_clone = token.clone();
@@ -700,6 +711,38 @@ impl KvIndexer {
                         Some(get_workers_req) = get_workers_rx.recv() => {
                             let workers = trie.get_workers();
                             let _ = get_workers_req.resp.send(workers);
+                        }
+
+                        Some(classify_req) = classify_rx.recv() => {
+                            // Drain all pending events before classifying so the trie
+                            // reflects the latest Stored/Removed state.
+                            while let Ok(event) = event_rx.try_recv() {
+                                let event_type = KvIndexerMetrics::get_event_type(&event.event.data);
+                                let event_for_prune = prune_manager.is_some().then(|| event.clone());
+                                let result = trie.apply_event(event);
+                                let result_is_ok = result.is_ok();
+                                metrics.increment_event_applied(event_type, result);
+
+                                if let Some(ref mut pm) = prune_manager {
+                                    if result_is_ok {
+                                        if let Some(ref ev) = event_for_prune {
+                                            if let KvCacheEventData::Stored(ref store_data) = ev.event.data {
+                                                let worker = WorkerWithDpRank::new(ev.worker_id, ev.event.dp_rank);
+                                                let block_entries: Vec<BlockEntry> = store_data.blocks.iter().enumerate().map(|(idx, block)| {
+                                                    BlockEntry {
+                                                        key: block.block_hash,
+                                                        worker,
+                                                        seq_position: idx,
+                                                    }
+                                                }).collect();
+                                                pm.insert(block_entries);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let classification = trie.classify_access_event(classify_req.worker, &classify_req.access_data);
+                            let _ = classify_req.resp.send(classification);
                         }
 
                         Some(_) = prune_rx.recv() => {
@@ -879,6 +922,7 @@ impl KvIndexer {
             get_workers_tx,
             dump_tx,
             routing_tx,
+            classify_tx,
             kv_block_size,
             _ref_count: Arc::new(()),
         }
@@ -930,6 +974,11 @@ impl KvIndexer {
     /// A `mpsc::Sender` for `GetWorkersRequest`s.
     pub fn get_workers_sender(&self) -> mpsc::Sender<GetWorkersRequest> {
         self.get_workers_tx.clone()
+    }
+
+    /// Get a sender for classify requests.
+    pub fn classify_sender(&self) -> mpsc::Sender<ClassifyRequest> {
+        self.classify_tx.clone()
     }
 }
 

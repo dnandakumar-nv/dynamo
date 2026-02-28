@@ -19,13 +19,14 @@ Events are published over the **Dynamo event plane**, a transport-agnostic pub/s
 
 ## Event Types
 
-The KV cache supports three event types:
+The KV cache supports four event types:
 
 | Event Type | Description | When to Publish |
 |------------|-------------|-----------------|
 | `BlockStored` | New blocks added to cache | After KV cache allocation succeeds |
 | `BlockRemoved` | Blocks evicted from cache | When blocks are evicted or freed |
 | `AllBlocksCleared` | All blocks removed | On cache reset or worker restart |
+| `BlockAccessed` | Per-request cache hit/miss report | Once per prefill batch entry, after prefix match is finalized |
 
 ### Event Structure
 
@@ -43,6 +44,72 @@ For `BlockStored` events:
 
 For `BlockRemoved` events:
 - **`block_hashes`**: List of sequence block hashes being evicted
+
+### BlockAccessed Event
+
+The `BlockAccessed` event is a per-request report emitted **once per prefill batch entry** after the engine's prefix match is finalized. It reports which blocks were served from the KV cache (hits) and which required fresh prefill computation (misses), enabling block-granularity cache efficiency tracking.
+
+Unlike the other event types which are lifecycle events (store/remove/clear), `BlockAccessed` is an observability event -- it does not change the indexer's block state but is used for metrics and API response enrichment.
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `block_hashes` | `list[int]` | Sequence block hashes for all blocks in this request's prefix. These use the same cumulative hash scheme as `BlockStored` events, so they can be correlated with the indexer's stored-block state. |
+| `request_id` | `str` | The unique identifier of the request within the engine. |
+| `num_cached` | `int` | Number of blocks that were cache hits. |
+| `num_prefilled` | `int` | Number of blocks that required fresh prefill. `num_cached + num_prefilled == len(block_hashes)`. |
+| `cached_mask` | `list[bool]` | Boolean mask aligned 1-to-1 with `block_hashes`. `True` at position *i* means the block was a cache hit. The boundary between the `True` prefix and the `False` suffix corresponds to the engine's prefix-match length. |
+| `medium_per_block` | `list[str | None]` | Storage medium each block resides on (e.g. `"GPU"`, `"CPU_PINNED"`). `None` for blocks that were not cached. |
+
+#### Data Flow
+
+```
+SGLang Scheduler
+  |  (emitted once per prefill batch entry via ZmqEventPublisher)
+  v
+ZMQ PUB socket  (tcp://127.0.0.1:5557)
+  |
+  v
+Dynamo KvEventPublisher  (ZMQ relay mode, subscribes and deserializes)
+  |
+  v
+Dynamo Event Plane  (NATS kv-events topic)
+  |
+  v
+KV Indexer  (processes Accessed variant, records Prometheus metrics)
+```
+
+#### ZMQ Wire Format
+
+```python
+{
+    "type": "BlockAccessed",
+    "block_hashes": [signed_i64, ...],   # Sequence block hashes (same scheme as BlockStored)
+    "request_id": str,                   # Engine request ID
+    "num_cached": int,                   # Cache hit count
+    "num_prefilled": int,                # Cache miss count
+    "cached_mask": [bool, ...],          # Per-block hit/miss mask
+    "medium_per_block": [str | None, ...],  # Storage medium per block
+}
+```
+
+#### Prometheus Metrics
+
+When the KV indexer processes `BlockAccessed` events, it records the following Prometheus metrics (all component-scoped with `dynamo_component_` prefix and `router_id` label):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dynamo_component_block_access_blocks_cached_total` | Counter | Total KV cache blocks served from cache across all requests. |
+| `dynamo_component_block_access_blocks_prefilled_total` | Counter | Total KV cache blocks freshly prefilled across all requests. |
+| `dynamo_component_block_access_request_cache_efficiency` | Histogram | Per-request cache efficiency ratio (`num_cached / total_blocks`, 0.0--1.0). Linear buckets of 0.05 from 0.0 to 1.0. |
+| `dynamo_component_block_access_access_events_total` | Counter | Total number of `BlockAccessed` events processed. |
+
+A pre-built Grafana dashboard (`deploy/observability/grafana_dashboards/block-access.json`) visualizes these metrics with panels for cache efficiency over time, cached vs prefilled block rates, and cumulative event counts.
+
+#### API Response Field
+
+When `BlockAccessed` events are available, the Dynamo decode handler passes a `block_cache_status` field through in the streaming response. This field contains the per-block cache hit/miss information from the engine's `meta_info`, enabling clients to observe cache behavior for individual requests without consulting Prometheus.
 
 ## Direct Publishing (Recommended for Custom Engines)
 
@@ -198,7 +265,7 @@ The ZMQ message format (compatible with SGLang / vLLM):
 | 2 | Sequence number (8 bytes, big-endian) |
 | 3 | Msgpack payload: `[timestamp, [events], dp_rank]` |
 
-Each event in the payload is a dictionary with a `type` field (`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`).
+Each event in the payload is a dictionary with a `type` field (`BlockStored`, `BlockRemoved`, `AllBlocksCleared`, or `BlockAccessed`).
 
 For `BlockStored`:
 ```python
@@ -223,6 +290,19 @@ For `BlockRemoved`:
 For `AllBlocksCleared`:
 ```python
 {"type": "AllBlocksCleared"}
+```
+
+For `BlockAccessed`:
+```python
+{
+    "type": "BlockAccessed",
+    "block_hashes": [signed_i64, ...],
+    "request_id": str,
+    "num_cached": int,
+    "num_prefilled": int,
+    "cached_mask": [bool, ...],
+    "medium_per_block": [str | None, ...],
+}
 ```
 
 ## API Reference

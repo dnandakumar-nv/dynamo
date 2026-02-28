@@ -44,7 +44,7 @@ use std::time::Duration;
 use dynamo_runtime::component::Component;
 use dynamo_runtime::metrics::MetricsHierarchy;
 use dynamo_runtime::metrics::prometheus_names::{
-    frontend_service, labels, name_prefix, router_request, routing_overhead,
+    block_access, frontend_service, labels, name_prefix, router_request, routing_overhead,
 };
 
 /// Build a router metric name: `"router_" + frontend_service_suffix`.
@@ -358,6 +358,146 @@ impl RouterRequestMetrics {
                 })
             })
             .clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block access metrics (dynamo_component_block_access_* via MetricsHierarchy)
+// ---------------------------------------------------------------------------
+
+/// Block-level cache access metrics observed when BlockAccessed events are processed.
+///
+/// Tracks how many KV cache blocks were served from cache vs freshly prefilled,
+/// providing visibility into cache efficiency at the block granularity.
+///
+/// Component-scoped via `from_component()` to get automatic `dynamo_component_` prefix,
+/// hierarchy labels, and registration with the DRT `MetricsRegistry`.
+pub struct BlockAccessMetrics {
+    pub blocks_cached_total: prometheus::IntCounter,
+    pub blocks_prefilled_total: prometheus::IntCounter,
+    pub request_cache_efficiency: prometheus::Histogram,
+    pub access_events_total: prometheus::IntCounter,
+    pub misses_routing_total: prometheus::IntCounter,
+    pub misses_eviction_total: prometheus::IntCounter,
+    pub misses_cold_total: prometheus::IntCounter,
+}
+
+/// Prefix for block access metric names within the component hierarchy.
+/// Combined with the metric suffix, e.g. `"block_access_"` + `"blocks_cached_total"`
+/// yields `"block_access_blocks_cached_total"`, which after component.metrics() prepends
+/// `dynamo_component_` gives `dynamo_component_block_access_blocks_cached_total`.
+const BLOCK_ACCESS_PREFIX: &str = "block_access_";
+
+/// Build a block access metric name: `"block_access_" + suffix`.
+fn block_access_metric(suffix: &str) -> String {
+    format!("{}{}", BLOCK_ACCESS_PREFIX, suffix)
+}
+
+static BLOCK_ACCESS_METRICS: OnceLock<Arc<BlockAccessMetrics>> = OnceLock::new();
+
+impl BlockAccessMetrics {
+    /// Create from a Component, memoized in a static OnceLock.
+    /// Uses the MetricsHierarchy API which auto-prepends `dynamo_component_`,
+    /// injects hierarchy labels, and registers with the DRT `MetricsRegistry`.
+    /// Also adds `router_id` (discovery instance_id) to distinguish router instances.
+    pub fn from_component(component: &Component) -> Arc<Self> {
+        BLOCK_ACCESS_METRICS
+            .get_or_init(|| {
+                let instance_id = component.drt().discovery().instance_id();
+                let router_id = instance_id.to_string();
+                let extra_labels: &[(&str, &str)] = &[(labels::ROUTER_ID, &router_id)];
+
+                let metrics = component.metrics();
+                let blocks_cached_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::BLOCKS_CACHED_TOTAL),
+                        "Total KV cache blocks served from cache",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_blocks_cached_total");
+                let blocks_prefilled_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::BLOCKS_PREFILLED_TOTAL),
+                        "Total KV cache blocks freshly prefilled",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_blocks_prefilled_total");
+                let request_cache_efficiency = metrics
+                    .create_histogram(
+                        &block_access_metric(block_access::REQUEST_CACHE_EFFICIENCY),
+                        "Per-request block-level cache efficiency (cached / total, 0.0-1.0)",
+                        extra_labels,
+                        Some(prometheus::linear_buckets(0.0, 0.05, 21).unwrap()),
+                    )
+                    .expect("failed to create block_access_request_cache_efficiency");
+                let access_events_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::ACCESS_EVENTS_TOTAL),
+                        "Total BlockAccessed events processed",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_access_events_total");
+                let misses_routing_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::MISSES_ROUTING_TOTAL),
+                        "Total miss blocks caused by routing to wrong worker",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_misses_routing_total");
+                let misses_eviction_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::MISSES_EVICTION_TOTAL),
+                        "Total miss blocks caused by eviction from cache",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_misses_eviction_total");
+                let misses_cold_total = metrics
+                    .create_intcounter(
+                        &block_access_metric(block_access::MISSES_COLD_TOTAL),
+                        "Total miss blocks that were never seen (cold)",
+                        extra_labels,
+                    )
+                    .expect("failed to create block_access_misses_cold_total");
+                Arc::new(Self {
+                    blocks_cached_total,
+                    blocks_prefilled_total,
+                    request_cache_efficiency,
+                    access_events_total,
+                    misses_routing_total,
+                    misses_eviction_total,
+                    misses_cold_total,
+                })
+            })
+            .clone()
+    }
+
+    /// Record block access metrics for a single BlockAccessed event.
+    ///
+    /// Increments the cached and prefilled counters by the given amounts,
+    /// observes the cache efficiency ratio in the histogram, and increments
+    /// the event counter.
+    pub fn record(&self, num_cached: u32, num_prefilled: u32) {
+        self.blocks_cached_total.inc_by(num_cached as u64);
+        self.blocks_prefilled_total.inc_by(num_prefilled as u64);
+        let total = num_cached + num_prefilled;
+        if total > 0 {
+            let efficiency = num_cached as f64 / total as f64;
+            self.request_cache_efficiency.observe(efficiency);
+        }
+        self.access_events_total.inc();
+    }
+
+    /// Record miss-reason breakdown from a MissClassification.
+    pub fn record_classification(
+        &self,
+        classification: &dynamo_kv_router::radix_tree::MissClassification,
+    ) {
+        self.misses_routing_total
+            .inc_by(classification.routing_misses as u64);
+        self.misses_eviction_total
+            .inc_by(classification.eviction_misses as u64);
+        self.misses_cold_total
+            .inc_by(classification.cold_misses as u64);
     }
 }
 

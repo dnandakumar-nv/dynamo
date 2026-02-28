@@ -39,14 +39,14 @@ scrape_configs:
   - job_name: 'dynamo-frontend'
     scrape_interval: 10s
     static_configs:
-      - targets: ['host.docker.internal:8000']  # on the "monitoring" network
+      - targets: ['host.docker.internal:8000', 'host.docker.internal:8001']
 
   # Launch via: DYN_SYSTEM_PORT=8081 dynamo.<backend> ...
   # If you want to update the scrape_interval, you may want to also update component.rs's MAX_DELAY
   - job_name: 'dynamo-backend'
     scrape_interval: 6s
     static_configs:
-      - targets: ['host.docker.internal:8081']
+      - targets: ['host.docker.internal:8081', 'host.docker.internal:8082']
 
 
   # KVBM leader related metrics

@@ -198,6 +198,7 @@ fn convert_to_zmq_events(
             vec![ZmqRawKvEvent::BlockRemoved { block_hashes }]
         }
         KvCacheEventData::Cleared => vec![],
+        KvCacheEventData::Accessed(_) => vec![],
     }
 }
 

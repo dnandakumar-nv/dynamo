@@ -112,6 +112,13 @@ async def init_decode(
             "The chat template will be loaded but the /v1/chat/completions endpoint will not be available."
         )
 
+    # Serve cache_control endpoint alongside generate so the KV router
+    # can send pin_prefix / evict_prefix / demote_prefix / promote_prefix
+    # operations to the same worker instance.
+    cache_control_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.cache_control"
+    )
+
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
@@ -119,6 +126,10 @@ async def init_decode(
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
+            ),
+            cache_control_endpoint.serve_endpoint(
+                handler.cache_control,
+                graceful_shutdown=True,
             ),
             register_model_with_readiness_gate(
                 engine,

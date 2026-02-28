@@ -64,6 +64,16 @@ pub struct RoutingHints {
     /// When set, only workers in this set are considered during scoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+
+    /// Cache lifecycle action to execute after generation completes.
+    /// Resolved from `nvext.agent_hints.cache_action`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_action: Option<String>,
+
+    /// Prefix ownership identifier for cache-aware eviction.
+    /// Resolved from `nvext.agent_hints.prefix_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

@@ -27,11 +27,12 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::indexer::SyncIndexer;
 use crate::protocols::*;
+use crate::radix_tree::{EvictionHistory, MissClassification, DEFAULT_EVICTION_HISTORY_CAPACITY};
 
 /// Thread-safe shared reference to a Block.
 type SharedBlock = Arc<RwLock<Block>>;
@@ -102,6 +103,9 @@ pub struct ConcurrentRadixTree {
     /// Outer RwLock protects the worker map structure (rarely mutated);
     /// inner RwLock per worker protects that worker's block-hash map.
     lookup: RwLock<FxHashMap<WorkerWithDpRank, RwLock<WorkerLookup>>>,
+
+    /// Bounded set of recently-removed block hashes for miss classification.
+    eviction_history: Mutex<EvictionHistory>,
 }
 
 impl Default for ConcurrentRadixTree {
@@ -145,6 +149,7 @@ impl ConcurrentRadixTree {
         Self {
             root: Arc::new(RwLock::new(Block::new())),
             lookup: RwLock::new(FxHashMap::default()),
+            eviction_history: Mutex::new(EvictionHistory::new(DEFAULT_EVICTION_HISTORY_CAPACITY)),
         }
     }
 
@@ -304,6 +309,10 @@ impl ConcurrentRadixTree {
                 self.clear_all_blocks(worker.worker_id);
                 Ok(())
             }
+            KvCacheEventData::Accessed(_) => {
+                // BlockAccessed is informational only; no tree mutation needed.
+                Ok(())
+            }
         }
     }
 
@@ -314,6 +323,14 @@ impl ConcurrentRadixTree {
         op: KvCacheStoreData,
         id: u64,
     ) -> Result<(), KvCacheEventError> {
+        // Remove re-stored block hashes from eviction history
+        {
+            let mut eh = self.eviction_history.lock();
+            for block_data in &op.blocks {
+                eh.remove(&block_data.block_hash);
+            }
+        }
+
         // Ensure this worker has an entry in the outer map.
         if !self.lookup.read().contains_key(&worker) {
             self.lookup
@@ -444,6 +461,8 @@ impl ConcurrentRadixTree {
             guard.workers.remove(&worker);
             if guard.workers.is_empty() {
                 guard.children.clear();
+                // Track in eviction history (block gone from all workers)
+                self.eviction_history.lock().insert(block_hash);
             }
         }
 
@@ -566,6 +585,42 @@ impl ConcurrentRadixTree {
         }
 
         events
+    }
+
+    /// Classify each missed block in a BlockAccessed event.
+    ///
+    /// Thread-safe: acquires read lock on lookup, brief lock on eviction_history.
+    pub fn classify_access_event(
+        &self,
+        worker: WorkerWithDpRank,
+        access_data: &KvCacheAccessData,
+    ) -> MissClassification {
+        let lk = self.lookup.read();
+        let mut result = MissClassification::default();
+
+        for (i, &is_cached) in access_data.cached_mask.iter().enumerate() {
+            if is_cached {
+                result.hits += 1;
+                continue;
+            }
+
+            let block_hash = &access_data.block_hashes[i];
+
+            // Check if block exists on any other worker
+            let exists_on_other = lk.iter().any(|(w, inner)| {
+                *w != worker && inner.read().contains_key(block_hash)
+            });
+
+            if exists_on_other {
+                result.routing_misses += 1;
+            } else if self.eviction_history.lock().contains(block_hash) {
+                result.eviction_misses += 1;
+            } else {
+                result.cold_misses += 1;
+            }
+        }
+
+        result
     }
 
     /// Get total number of blocks across all workers.

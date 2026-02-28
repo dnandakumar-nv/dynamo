@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::kv_router::{
     Indexer, KV_EVENT_SUBJECT, KvRouterConfig, RADIX_STATE_BUCKET, RADIX_STATE_FILE,
-    protocols::RouterEvent, router_discovery_query,
+    protocols::RouterEvent,
+    router_discovery_query,
 };
 
 /// Helper function to create a KV stream name from a component and subject.
