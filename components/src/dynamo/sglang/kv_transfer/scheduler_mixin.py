@@ -945,3 +945,21 @@ def install_kv_transfer_methods(scheduler_class):
             self.process_kv_transfers()
 
     scheduler_class.process_input_requests = _process_input_requests_with_kv_poll
+
+    # Wrap self_check_during_idle to skip check_memory when there are
+    # in-flight RDMA transfers. Pending transfers have pages allocated
+    # from the KV pool but not yet inserted into the radix tree, so
+    # check_memory sees them as "leaked" and crashes the scheduler.
+    _original_self_check = scheduler_class.self_check_during_idle
+
+    def _self_check_with_transfer_guard(self):
+        if hasattr(self, "_pending_kv_transfers") and self._pending_kv_transfers:
+            # Poll transfers instead of idle-checking — pages are in flight
+            self.process_kv_transfers()
+            return
+        if hasattr(self, "_transfer_pending_locks") and self._transfer_pending_locks:
+            # Release stale locks before check_memory sees them as leaked
+            self._cleanup_stale_transfer_locks(max_age_s=0)
+        _original_self_check(self)
+
+    scheduler_class.self_check_during_idle = _self_check_with_transfer_guard
