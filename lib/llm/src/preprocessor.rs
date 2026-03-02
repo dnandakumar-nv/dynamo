@@ -289,6 +289,7 @@ impl OpenAIPreprocessor {
                 allowed_worker_ids: None,
                 cache_action: hints.and_then(|h| h.cache_action.clone()),
                 prefix_id: hints.and_then(|h| h.prefix_id.clone()),
+                transfer_hint: None, // Set later by the KV router
             };
             builder.routing(Some(routing));
         } else if lora_name.is_some() {

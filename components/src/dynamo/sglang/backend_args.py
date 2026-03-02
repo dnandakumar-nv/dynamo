@@ -94,6 +94,38 @@ class DynamoSGLangArgGroup(ArgGroup):
             default=False,
             help="Run as video generation worker for video generation (T2V/I2V).",
         )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-kv-transfer",
+            env_var="DYN_SGL_ENABLE_KV_TRANSFER",
+            default=False,
+            help="Enable cross-worker KV cache transfer service. "
+            "When enabled, this worker can receive KV blocks from "
+            "remote workers and serve its own blocks to others via NIXL RDMA.",
+        )
+        add_argument(
+            g,
+            flag_name="--transfer-timeout-ms",
+            env_var="DYN_SGL_TRANSFER_TIMEOUT_MS",
+            default=5000,
+            arg_type=int,
+            help="NIXL transfer timeout in milliseconds (default: 5000).",
+        )
+        add_argument(
+            g,
+            flag_name="--metadata-cache-ttl-s",
+            env_var="DYN_SGL_METADATA_CACHE_TTL_S",
+            default=300,
+            arg_type=int,
+            help="Metadata cache TTL in seconds for remote worker NIXL info (default: 300).",
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-transfer-overlap",
+            env_var="DYN_SGL_ENABLE_TRANSFER_OVERLAP",
+            default=False,
+            help="Enable transfer/prefill overlap optimization (experimental, default: disabled).",
+        )
 
 
 class DynamoSGLangConfig(ConfigBase):
@@ -110,6 +142,10 @@ class DynamoSGLangConfig(ConfigBase):
     disagg_config_key: Optional[str] = None
 
     video_generation_worker: bool
+    enable_kv_transfer: bool = False
+    transfer_timeout_ms: int = 5000
+    metadata_cache_ttl_s: int = 300
+    enable_transfer_overlap: bool = False
 
     def validate(self) -> None:
         if (self.disagg_config is not None) ^ (self.disagg_config_key is not None):

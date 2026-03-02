@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::timing::RequestTracker;
 use super::{OutputOptions, SamplingOptions, StopConditions};
 use crate::kv_router::RouterConfigOverride;
-use crate::kv_router::protocols::{BlockExtraInfo, WorkerId};
+use crate::kv_router::protocols::{BlockExtraInfo, TransferHint, WorkerId};
 use crate::preprocessor::media::RdmaMediaDataDescriptor;
 use crate::protocols::TokenIdType;
 
@@ -74,6 +74,11 @@ pub struct RoutingHints {
     /// Resolved from `nvext.agent_hints.prefix_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_id: Option<String>,
+
+    /// Transfer hint from the KV router indicating KV cache blocks
+    /// should be pulled from a source worker to this target worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_hint: Option<TransferHint>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

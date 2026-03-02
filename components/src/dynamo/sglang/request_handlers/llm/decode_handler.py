@@ -158,6 +158,68 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 async for out in self._process_text_stream(decode, context):
                     yield out
         else:
+            # Attempt KV transfer if hint present and manager available
+            routing = request.get("routing") or {}
+            transfer_hint = routing.get("transfer_hint")
+            if (
+                transfer_hint
+                and self.kv_transfer_manager is not None
+            ):
+                token_ids = request.get("token_ids", [])
+                if token_ids:
+                    try:
+                        transfer_start = time.monotonic()
+                        transfer_result = (
+                            await self.kv_transfer_manager.target_handler
+                            .execute_transfer(
+                                transfer_hint=transfer_hint,
+                                token_ids=token_ids,
+                            )
+                        )
+                        transfer_elapsed_ms = (
+                            time.monotonic() - transfer_start
+                        ) * 1000
+
+                        if transfer_result.success:
+                            logging.info(
+                                f"KV transfer: {transfer_result.num_blocks} blocks "
+                                f"({transfer_result.transferred_tokens} tokens) "
+                                f"transferred from source in "
+                                f"{transfer_elapsed_ms:.1f}ms"
+                            )
+                            # Publish KV events so router learns about new blocks
+                            kv_pub = self.kv_publisher
+                            if kv_pub is not None:
+                                try:
+                                    self.kv_transfer_manager.publish_transferred_blocks(
+                                        token_ids=token_ids,
+                                        num_blocks=transfer_result.num_blocks,
+                                        kv_publisher=kv_pub,
+                                    )
+                                    from dynamo.sglang.kv_transfer.metrics import (
+                                        record_events_published,
+                                    )
+
+                                    record_events_published()
+                                except Exception as pub_err:
+                                    logging.warning(
+                                        f"Failed to publish transfer KV events: {pub_err}"
+                                    )
+                        else:
+                            logging.debug(
+                                f"KV transfer skipped ({transfer_result.error}), "
+                                f"proceeding with full prefill"
+                            )
+                    except Exception as e:
+                        logging.debug(
+                            f"KV transfer error ({e}), proceeding with full prefill"
+                        )
+                else:
+                    logging.debug(
+                        "KV transfer hint present but token_ids empty "
+                        "(skip_tokenizer_init=False?), skipping transfer"
+                    )
+
             # Extract image URLs for multimodal requests. SGLang's mm_data_processor
             # handles loading/preprocessing, and the scheduler does vision encoding.
             image_data = None

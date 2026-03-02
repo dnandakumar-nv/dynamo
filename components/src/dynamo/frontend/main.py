@@ -194,6 +194,10 @@ async def async_main():
             router_queue_threshold=config.router_queue_threshold,
             router_event_threads=config.router_event_threads,
             router_enable_cache_control=config.router_enable_cache_control,
+            enable_kv_transfer=config.enable_kv_transfer,
+            transfer_cost_weight=config.transfer_cost_weight,
+            min_transfer_queue_advantage=config.min_transfer_queue_advantage,
+            max_transfer_blocks=config.max_transfer_blocks,
         )
     elif config.router_mode == "random":
         router_mode = RouterMode.Random

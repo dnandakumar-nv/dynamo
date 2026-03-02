@@ -161,6 +161,7 @@ impl<P: SequencePublisher + 'static, C: WorkerConfigLike> SchedulerQueue<P, C> {
         request.respond(Ok(SchedulingResponse {
             best_worker: selection.worker,
             overlap_blocks: selection.overlap_blocks,
+            transfer_hint: selection.transfer_hint,
         }));
 
         if !request.update_states {

@@ -22,6 +22,48 @@ from dynamo.sglang.register import register_model_with_readiness_gate
 from dynamo.sglang.request_handlers import DecodeWorkerHandler, PrefillWorkerHandler
 
 
+def _run_scheduler_with_kv_transfer_mixin(*args, **kwargs):
+    """Wrapper for ``run_scheduler_process`` that installs the KV transfer
+    mixin before the Scheduler is instantiated.
+
+    This runs inside the spawned subprocess.  Must be a top-level function
+    (not a closure) so it is picklable by ``mp.Process`` with ``spawn``.
+    """
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+
+        from dynamo.sglang.kv_transfer.scheduler_mixin import (
+            install_kv_transfer_methods,
+        )
+
+        install_kv_transfer_methods(Scheduler)
+    except Exception as exc:
+        logging.warning(f"KV Transfer mixin install failed in subprocess: {exc}")
+
+    from sglang.srt.managers.scheduler import run_scheduler_process
+
+    return run_scheduler_process(*args, **kwargs)
+
+
+def _install_kv_transfer_mixin():
+    """Override Engine's scheduler process launcher to install KV transfer
+    methods inside the spawned subprocess.
+
+    SGLang uses ``mp.set_start_method("spawn")``, so monkey-patching the
+    Scheduler class in the main process has no effect — the subprocess
+    re-imports a clean Scheduler.  Instead we replace
+    ``Engine.run_scheduler_process_func`` with a top-level wrapper that
+    installs the mixin at the start of the subprocess, before the
+    Scheduler is instantiated.
+    """
+    from sglang.srt.entrypoints.engine import Engine
+
+    Engine.run_scheduler_process_func = staticmethod(
+        _run_scheduler_with_kv_transfer_mixin
+    )
+    logging.info("KV Transfer scheduler mixin will be installed in subprocess")
+
+
 async def _warmup_prefill_engine(engine: sgl.Engine, server_args) -> None:
     """Perform warmup request for prefill engine to reduce initial TTFT."""
     logging.info("Start of prefill disaggregation warmup ...")
@@ -65,6 +107,9 @@ async def init_decode(
 ):
     server_args, dynamo_args = config.server_args, config.dynamo_args
 
+    if getattr(dynamo_args, "enable_kv_transfer", False):
+        _install_kv_transfer_mixin()
+
     if server_args.node_rank >= 1:
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
@@ -101,6 +146,43 @@ async def init_decode(
     )
     handler.register_engine_routes(runtime)
 
+    # KV Transfer Service (optional, enabled by --enable-kv-transfer)
+    enable_kv_transfer = getattr(config.dynamo_args, "enable_kv_transfer", False)
+
+    kv_transfer_endpoint = None
+    source_handler = None
+
+    if enable_kv_transfer:
+        from dynamo.sglang.kv_transfer import KvTransferManager
+        from dynamo.sglang.kv_transfer.source_handler import KvTransferSourceHandler
+        from dynamo.sglang.kv_transfer.target_handler import KvTransferTargetHandler
+
+        kv_transfer_manager = KvTransferManager(
+            engine,
+            config,
+            metadata_cache_ttl_s=getattr(dynamo_args, "metadata_cache_ttl_s", 300),
+            transfer_timeout_ms=getattr(dynamo_args, "transfer_timeout_ms", 5000),
+        )
+        await kv_transfer_manager.initialize()
+
+        source_handler = KvTransferSourceHandler(kv_transfer_manager)
+
+        target_handler = KvTransferTargetHandler(kv_transfer_manager)
+        await target_handler.set_transfer_endpoint(
+            runtime,
+            dynamo_args.namespace,
+            dynamo_args.component,
+        )
+
+        kv_transfer_manager.target_handler = target_handler
+        handler.kv_transfer_manager = kv_transfer_manager
+
+        kv_transfer_endpoint = runtime.endpoint(
+            f"{dynamo_args.namespace}.{dynamo_args.component}.kv_transfer"
+        )
+
+        logging.info("KV Transfer Service initialized")
+
     health_check_payload = SglangHealthCheckPayload(
         engine, use_text_input=dynamo_args.use_sglang_tokenizer
     ).to_dict()
@@ -120,7 +202,7 @@ async def init_decode(
     )
 
     try:
-        await asyncio.gather(
+        gather_tasks = [
             generate_endpoint.serve_endpoint(
                 handler.generate,
                 graceful_shutdown=True,
@@ -139,7 +221,17 @@ async def init_decode(
                 output_type=parse_endpoint_types(dynamo_args.endpoint_types),
                 readiness_gate=ready_event,
             ),
-        )
+        ]
+
+        if kv_transfer_endpoint is not None:
+            gather_tasks.append(
+                kv_transfer_endpoint.serve_endpoint(
+                    source_handler.handle_request,
+                    graceful_shutdown=True,
+                )
+            )
+
+        await asyncio.gather(*gather_tasks)
     except Exception as e:
         logging.error(f"Failed to serve endpoints: {e}")
         raise

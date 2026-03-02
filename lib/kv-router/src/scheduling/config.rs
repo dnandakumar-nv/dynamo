@@ -91,6 +91,32 @@ pub struct KvRouterConfig {
     /// requests, firing a pin_prefix call (with TTL) to the worker after generation completes.
     /// When false (default), cache_control is ignored and no cache_control client is created.
     pub router_enable_cache_control: bool,
+
+    /// Enable cross-worker KV cache transfer hints in routing decisions.
+    /// When true, the router may select a less-loaded worker and attach a
+    /// TransferHint indicating which blocks can be pulled from a remote worker.
+    /// Default: false.
+    pub enable_kv_transfer: bool,
+
+    /// Cost weight for block transfer relative to prefill computation.
+    /// A transferred block costs `transfer_cost_weight` in the cost function,
+    /// while a prefilled block costs `overlap_score_weight`.
+    /// Should be < overlap_score_weight since RDMA is faster than prefill.
+    /// Default: 0.1
+    #[validate(range(min = 0.0))]
+    pub transfer_cost_weight: f64,
+
+    /// Minimum decode-block difference between the best-cache worker and the
+    /// target worker required to trigger a transfer routing decision.
+    /// Prevents transfers when queues are similarly loaded.
+    /// Default: 8
+    pub min_transfer_queue_advantage: u64,
+
+    /// Maximum number of KV blocks to transfer in a single request.
+    /// Limits RDMA transfer size to avoid saturating the network.
+    /// Default: 256
+    #[validate(range(min = 1))]
+    pub max_transfer_blocks: u32,
 }
 
 impl Default for KvRouterConfig {
@@ -112,6 +138,10 @@ impl Default for KvRouterConfig {
             router_queue_threshold: None,
             router_event_threads: 4,
             router_enable_cache_control: false,
+            enable_kv_transfer: false,
+            transfer_cost_weight: 0.1,
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
         }
     }
 }

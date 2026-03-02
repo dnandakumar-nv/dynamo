@@ -982,6 +982,11 @@ class KvRouterConfig:
         router_prune_target_ratio: float = 0.8,
         router_queue_threshold: Optional[float] = None,
         router_event_threads: int = 4,
+        router_enable_cache_control: bool = False,
+        enable_kv_transfer: bool = False,
+        transfer_cost_weight: float = 0.1,
+        min_transfer_queue_advantage: int = 8,
+        max_transfer_blocks: int = 256,
     ) -> None:
         """
         Create a KV router configuration.
@@ -1012,6 +1017,15 @@ class KvRouterConfig:
                 If None, queueing is disabled and all requests go directly to the scheduler.
             router_event_threads: Number of event processing threads (default: 4).
                 When > 1, uses a concurrent radix tree with a thread pool.
+            router_enable_cache_control: Enable cache control PIN operations (default: False).
+            enable_kv_transfer: Enable cross-worker KV cache transfer hints (default: False).
+                When True, the router may select a less-loaded worker and attach a
+                TransferHint indicating which blocks can be pulled from a remote worker.
+            transfer_cost_weight: Cost weight for block transfer relative to prefill (default: 0.1).
+                Should be less than overlap_score_weight since RDMA is faster than prefill.
+            min_transfer_queue_advantage: Minimum decode-block difference between the
+                best-cache worker and target to trigger transfer (default: 8).
+            max_transfer_blocks: Maximum KV blocks to transfer in a single request (default: 256).
         """
         ...
 

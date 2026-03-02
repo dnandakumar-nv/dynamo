@@ -126,6 +126,7 @@ class BaseWorkerHandler(BaseGenerativeHandler):
             self.metrics_publisher = None
             self.kv_publisher = None
         self.serving_mode = config.serving_mode
+        self.kv_transfer_manager = None  # Set by init_decode if --enable-kv-transfer
         self.skip_tokenizer_init = config.server_args.skip_tokenizer_init
         self.enable_trace = config.server_args.enable_trace
 

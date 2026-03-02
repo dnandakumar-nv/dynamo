@@ -910,7 +910,7 @@ impl KvRouter {
         let update_states = request_id.is_some();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (best_worker, overlap_blocks) = chooser
+            let (best_worker, overlap_blocks, _transfer_hint) = chooser
                 .find_best_match(
                     request_id.as_deref(),
                     &token_ids,

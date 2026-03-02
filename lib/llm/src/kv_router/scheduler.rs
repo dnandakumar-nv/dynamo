@@ -4,7 +4,7 @@
 pub use dynamo_kv_router::scheduling::{
     KvSchedulerError, PotentialLoad, SchedulingRequest, SchedulingResponse,
 };
-pub use dynamo_kv_router::selector::DefaultWorkerSelector;
+pub use dynamo_kv_router::selector::{DefaultWorkerSelector, TransferAwareWorkerSelector};
 
 use super::KvRouterConfig;
 use super::RouterConfigOverride;
@@ -42,7 +42,14 @@ impl KvScheduler {
         kv_router_config: &KvRouterConfig,
         worker_type: &'static str,
     ) -> Result<Self, KvSchedulerError> {
-        let selector = selector.unwrap_or(Box::new(DefaultWorkerSelector::default()));
+        let selector = selector.unwrap_or_else(|| {
+            if kv_router_config.enable_kv_transfer {
+                tracing::info!("Using TransferAwareWorkerSelector (enable_kv_transfer=true)");
+                Box::new(TransferAwareWorkerSelector::new(Some(*kv_router_config)))
+            } else {
+                Box::new(DefaultWorkerSelector::new(Some(*kv_router_config)))
+            }
+        });
 
         // Get initial workers from watch receiver.
         // Caller must ensure at least one worker is present (via wait_for).

@@ -65,6 +65,10 @@ class FrontendConfig(ConfigBase):
     router_event_threads: int
     router_queue_threshold: Optional[float]
     router_enable_cache_control: bool
+    enable_kv_transfer: bool
+    transfer_cost_weight: float
+    min_transfer_queue_advantage: int
+    max_transfer_blocks: int
     decode_fallback: bool
 
     migration_limit: int
@@ -388,6 +392,51 @@ class FrontendArgGroup(ArgGroup):
                 "a cache_control service mesh client and fires pin_prefix after generation for "
                 "requests with nvext.cache_control. Requires --router-mode=kv."
             ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-kv-transfer",
+            env_var="DYN_ENABLE_KV_TRANSFER",
+            default=False,
+            dest="enable_kv_transfer",
+            help=(
+                "KV Router: Enable cross-worker KV cache transfer hints. When set, the router "
+                "may select a less-loaded worker and attach a TransferHint indicating which blocks "
+                "can be pulled from a remote worker via RDMA. Requires --router-mode=kv."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--transfer-cost-weight",
+            env_var="DYN_TRANSFER_COST_WEIGHT",
+            default=0.1,
+            help=(
+                "KV Router: Cost weight for block transfer relative to prefill computation. "
+                "Should be less than --router-kv-overlap-score-weight since RDMA is faster than prefill."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--min-transfer-queue-advantage",
+            env_var="DYN_MIN_TRANSFER_QUEUE_ADVANTAGE",
+            default=8,
+            help=(
+                "KV Router: Minimum decode-block difference between the best-cache worker and "
+                "the target worker required to trigger a transfer routing decision."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--max-transfer-blocks",
+            env_var="DYN_MAX_TRANSFER_BLOCKS",
+            default=256,
+            help=(
+                "KV Router: Maximum number of KV blocks to transfer in a single request. "
+                "Limits RDMA transfer size to avoid saturating the network."
+            ),
+            arg_type=int,
         )
         add_negatable_bool_argument(
             g,

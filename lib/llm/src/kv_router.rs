@@ -57,8 +57,8 @@ use crate::{
         indexer::{GetWorkersRequest, KvIndexer, KvIndexerInterface, KvRouterError},
         protocols::{
             BlockExtraInfo, DpRank, KvCacheAccessData, LocalBlockHash, OverlapScores, RouterEvent,
-            RouterRequest, RouterResponse, TokensWithHashes, WorkerId, WorkerSelectionResult,
-            WorkerWithDpRank, compute_block_hash_for_seq,
+            RouterRequest, RouterResponse, TokensWithHashes, WorkerId, WorkerWithDpRank,
+            compute_block_hash_for_seq,
         },
         scheduler::{KvScheduler, PotentialLoad},
         sequence::{SequenceError, SequenceRequest},
@@ -400,7 +400,7 @@ impl KvRouter {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
-    ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
+    ) -> anyhow::Result<(WorkerWithDpRank, u32, Option<protocols::TransferHint>)> {
         let start = Instant::now();
 
         if update_states && context_id.is_none() {
@@ -474,7 +474,7 @@ impl KvRouter {
             "find_best_match completed"
         );
 
-        Ok((response.best_worker, response.overlap_blocks))
+        Ok((response.best_worker, response.overlap_blocks, response.transfer_hint))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -598,7 +598,7 @@ impl AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Er
                 tokens,
                 block_mm_infos,
             } => {
-                let (best_worker, overlap_blocks) = self
+                let (best_worker, overlap_blocks, _transfer_hint) = self
                     .find_best_match(
                         Some(&context_id),
                         &tokens,

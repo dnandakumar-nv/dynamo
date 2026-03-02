@@ -529,7 +529,7 @@ impl PrefillRouter {
 
         match prefill_router {
             InnerPrefillRouter::KvRouter(r) => {
-                let (worker, _overlap) = r
+                let (worker, _overlap, _transfer_hint) = r
                     .chooser
                     .find_best_match(
                         None,

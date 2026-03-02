@@ -19,7 +19,6 @@ use dynamo_runtime::{
 use crate::{
     kv_router::{
         KvRouter, KvRouterConfig, protocols::WorkerId, router_endpoint_id,
-        scheduler::DefaultWorkerSelector,
     },
     local_model::runtime_config::DisaggregatedEndpoint,
     model_card::ModelDeploymentCard,
@@ -598,13 +597,12 @@ impl ModelManager {
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = Box::new(DefaultWorkerSelector::new(kv_router_config));
         let chooser = KvRouter::new(
             endpoint.clone(),
             client,
             workers_with_configs,
             kv_cache_block_size,
-            Some(selector),
+            None,
             kv_router_config,
             worker_type,
         )

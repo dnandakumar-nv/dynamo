@@ -40,10 +40,10 @@ pub use indexer::{MaybeError, SyncIndexer, ThreadPoolIndexer};
 pub use naive_indexers::{InvertedIndex, NaiveNestedMap};
 pub use nested_map::PositionalIndexer;
 pub use protocols::{
-    KvCacheEventError, LocalBlockHash, OverlapScores, RouterEvent, WorkerConfigLike, WorkerId,
-    compute_block_hash_for_seq,
+    KvCacheEventError, LocalBlockHash, OverlapScores, RouterEvent, TransferHint, WorkerConfigLike,
+    WorkerId, compute_block_hash_for_seq,
 };
 pub use queue::SchedulerQueue;
 pub use radix_tree::RadixTree;
 pub use scheduling::{KvSchedulerError, PotentialLoad, SchedulingRequest, SchedulingResponse};
-pub use selector::{DefaultWorkerSelector, WorkerSelector};
+pub use selector::{DefaultWorkerSelector, TransferAwareWorkerSelector, WorkerSelector};

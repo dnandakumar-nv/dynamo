@@ -168,6 +168,18 @@ pub enum RouterResponse {
     },
 }
 
+/// Hint attached to a routing decision indicating that KV cache blocks
+/// are available on a source worker and could be transferred to the
+/// selected target worker instead of recomputed via prefill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferHint {
+    /// Worker that has the cached blocks (the source).
+    pub source_worker: WorkerWithDpRank,
+    /// Number of contiguous prefix blocks available on the source,
+    /// starting from position 0.
+    pub num_blocks: u32,
+}
+
 #[derive(Debug)]
 pub struct WorkerSelectionResult {
     /// The full worker information including dp_rank
@@ -179,6 +191,10 @@ pub struct WorkerSelectionResult {
     /// The number of blocks that the selected worker may already have cached.
     /// This is not a guarantee, but an estimate.
     pub overlap_blocks: u32,
+
+    /// If set, the selected worker should pull KV blocks from the source
+    /// worker instead of recomputing them via prefill.
+    pub transfer_hint: Option<TransferHint>,
 }
 
 /// Active load metrics for a worker, used for busy detection.

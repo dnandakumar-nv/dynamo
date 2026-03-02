@@ -7,7 +7,7 @@ use dynamo_tokens::SequenceHash;
 use serde::{Deserialize, Serialize};
 
 use super::config::RouterConfigOverride;
-use crate::protocols::{DpRank, OverlapScores, WorkerId, WorkerWithDpRank};
+use crate::protocols::{DpRank, OverlapScores, TransferHint, WorkerId, WorkerWithDpRank};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PotentialLoad {
@@ -33,6 +33,9 @@ pub enum KvSchedulerError {
 pub struct SchedulingResponse {
     pub best_worker: WorkerWithDpRank,
     pub overlap_blocks: u32,
+    /// Transfer hint from the selector, if a cross-worker transfer
+    /// was deemed beneficial.
+    pub transfer_hint: Option<TransferHint>,
 }
 
 pub struct SchedulingRequest {

@@ -40,11 +40,13 @@ pub struct KvPushRouter {
     cache_control_cell: Option<OnceCell<CacheControlClient>>,
 }
 
-/// Result of worker selection containing instance ID, dp_rank, and overlap amount.
+/// Result of worker selection containing instance ID, dp_rank, overlap amount, and optional transfer hint.
 struct WorkerSelection {
     instance_id: u64,
     dp_rank: u32,
     overlap_amount: u32,
+    /// If set, indicates KV blocks should be transferred from a source worker.
+    transfer_hint: Option<crate::kv_router::protocols::TransferHint>,
 }
 
 /// Drop guard that manages the full lifecycle of a routed request:
@@ -270,7 +272,7 @@ impl KvPushRouter {
         };
 
         let Some(id) = preselected_id else {
-            let (best_worker, overlap_amount) = self
+            let (best_worker, overlap_amount, transfer_hint) = self
                 .chooser
                 .find_best_match(
                     Some(context_id),
@@ -303,12 +305,25 @@ impl KvPushRouter {
                     overlap_amount,
                     total_blocks,
                 );
+
+                if let Some(ref hint) = transfer_hint {
+                    tracing::info!(
+                        request_id = %context_id,
+                        target_worker = best_worker.worker_id,
+                        source_worker = hint.source_worker.worker_id,
+                        num_blocks = hint.num_blocks,
+                        "[ROUTING] Transfer hint: pull {} blocks from worker_{}",
+                        hint.num_blocks,
+                        hint.source_worker.worker_id,
+                    );
+                }
             }
 
             return Ok(WorkerSelection {
                 instance_id: best_worker.worker_id,
                 dp_rank: best_worker.dp_rank,
                 overlap_amount,
+                transfer_hint,
             });
         };
 
@@ -350,6 +365,7 @@ impl KvPushRouter {
             instance_id: id,
             dp_rank,
             overlap_amount: overlap_blocks,
+            transfer_hint: None,
         })
     }
 }
@@ -403,6 +419,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             instance_id,
             dp_rank,
             overlap_amount,
+            transfer_hint,
         } = selection;
 
         // In approximate mode (use_kv_events=false), record the routing decision
@@ -583,6 +600,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
 
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(dp_rank);
+        backend_input.routing_mut().transfer_hint = transfer_hint;
         let updated_request = context.map(|_| backend_input);
 
         // Record prefill start right before pushing to backend (OnceLock: first call wins).
