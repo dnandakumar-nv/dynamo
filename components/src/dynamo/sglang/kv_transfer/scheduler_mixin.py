@@ -16,11 +16,15 @@ need to return data accept a `result_file` parameter. The scheduler writes
 JSON results to this file, and the main process reads it after collective_rpc
 returns. This works because collective_rpc is synchronous (blocking).
 
-Non-blocking transfers: The initiate_kv_transfer + process_kv_transfers
-pattern splits RDMA into a fast initiation phase (~10ms via collective_rpc)
-and a non-blocking completion phase (polled each scheduler iteration via
-process_kv_transfers). This avoids blocking the scheduler for the 500-800ms
-duration of each RDMA transfer.
+Dedicated ZMQ channel for transfers: Transfer initiation bypasses
+collective_rpc entirely. The main process sends requests via per-rank
+ZMQ PUSH sockets; the scheduler drains them from PULL sockets each
+iteration in process_kv_transfers(). This avoids the ~530ms latency
+of collective_rpc (which waits for the scheduler's event loop) and
+removes lock serialization for concurrent transfers.
+
+Non-blocking RDMA: process_kv_transfers polls pending RDMA transfers
+each iteration. Completion is signalled via atomic completion files.
 """
 
 import json
@@ -39,11 +43,15 @@ def install_kv_transfer_methods(scheduler_class):
     getattr(self, method_name)(**params).
     """
 
-    def init_kv_transfer(self, page_size=16):
+    def init_kv_transfer(self, page_size=16, result_file=None):
         """Initialize NIXL transfer infrastructure.
 
         Registers KV cache GPU memory with NIXL agent for remote reads.
         Called via Engine.collective_rpc("init_kv_transfer").
+
+        Also creates a dedicated ZMQ PULL socket for receiving KV transfer
+        requests directly (bypassing collective_rpc). The IPC path is
+        written to result_file so the main process can connect PUSH sockets.
         """
         try:
             from nixl._api import nixl_agent, nixl_agent_config
@@ -110,8 +118,36 @@ def install_kv_transfer_methods(scheduler_class):
         self._nixl_source_metadata_cache = {}
 
         # Pending async KV transfers: transfer_id -> state dict.
-        # Populated by initiate_kv_transfer, drained by process_kv_transfers.
+        # Populated by _handle_kv_transfer_request, drained by
+        # process_kv_transfers.
         self._pending_kv_transfers = {}
+
+        # Create dedicated ZMQ PULL socket for receiving KV transfer
+        # requests directly from the main process (bypasses collective_rpc).
+        import tempfile
+
+        import zmq
+
+        tp_rank = getattr(self, "tp_rank", 0)
+        ipc_path = tempfile.mktemp(
+            prefix=f"kv_xfer_rank{tp_rank}_", dir="/tmp"
+        )
+        self._kv_transfer_ipc_path = ipc_path
+
+        kv_ctx = zmq.Context(1)
+        self._kv_transfer_recv = kv_ctx.socket(zmq.PULL)
+        self._kv_transfer_recv.bind(f"ipc://{ipc_path}")
+        self._kv_transfer_zmq_ctx = kv_ctx
+
+        logger.info(
+            f"KV Transfer socket bound: ipc://{ipc_path} (rank {tp_rank})"
+        )
+
+        # Write IPC path to result_file for main process to read
+        if result_file:
+            rank_file = f"{result_file}.rank{tp_rank}"
+            with open(rank_file, "w") as f:
+                json.dump({"status": "ok", "ipc_path": ipc_path}, f)
 
     def get_kv_transfer_metadata(self, result_file=None):
         """Return this worker's NIXL metadata + KV layout for remote workers.
@@ -193,21 +229,42 @@ def install_kv_transfer_methods(scheduler_class):
             with open(result_file, "w") as f:
                 json.dump(data, f)
 
-    def _resolve_source_metadata(self, source_worker_id, source_metadata_per_rank):
+    def _resolve_source_metadata(
+        self,
+        source_worker_id,
+        source_metadata_per_rank=None,
+        source_metadata=None,
+    ):
         """Resolve source metadata from parameters or cache, add NIXL peer.
 
         Returns (source_metadata, peer_name) for this TP rank.
-        Shared by both the synchronous (receive_kv_blocks) and asynchronous
-        (initiate_kv_transfer) paths.
+        Shared by the synchronous (receive_kv_blocks), collective_rpc
+        (initiate_kv_transfer), and socket-based (_handle_kv_transfer_request)
+        paths.
+
+        Args:
+            source_metadata_per_rank: List of per-rank metadata dicts
+                (from collective_rpc path, where all ranks get the same list).
+            source_metadata: Single-rank metadata dict (from socket path,
+                where each rank receives only its own metadata).
         """
         import base64
 
         tp_rank = getattr(self, "tp_rank", 0)
 
-        if source_metadata_per_rank is not None:
+        # Socket path: single-rank metadata provided directly
+        if source_metadata is not None:
+            if source_worker_id is not None:
+                self._nixl_source_metadata_cache[source_worker_id] = (
+                    source_metadata
+                )
+        elif source_metadata_per_rank is not None:
+            # Collective_rpc path: pick this rank's entry from the list
             source_metadata = source_metadata_per_rank[tp_rank]
             if source_worker_id is not None:
-                self._nixl_source_metadata_cache[source_worker_id] = source_metadata
+                self._nixl_source_metadata_cache[source_worker_id] = (
+                    source_metadata
+                )
         elif (
             source_worker_id is not None
             and source_worker_id in self._nixl_source_metadata_cache
@@ -562,96 +619,34 @@ def install_kv_transfer_methods(scheduler_class):
                     pass
             raise
 
-    def initiate_kv_transfer(
-        self,
-        source_kv_indices,
-        token_ids,
-        num_blocks,
-        timeout_ms=5000,
-        source_worker_id=None,
-        source_metadata_per_rank=None,
-        completion_file=None,
-    ):
-        """Initiate a non-blocking KV transfer (Phase 1: fast start).
-
-        Allocates local pages, builds NIXL descriptors, starts RDMA, and
-        returns immediately. The transfer completes asynchronously — polled
-        by process_kv_transfers() in the scheduler event loop.
-
-        Writes completion status to completion_file.rank{tp_rank} when RDMA
-        finishes (via process_kv_transfers).
-
-        Called via Engine.collective_rpc("initiate_kv_transfer", ...).
-        """
-        if not getattr(self, "_kv_transfer_enabled", False):
-            raise RuntimeError("KV transfer not initialized")
-
-        source_metadata, peer_name = self._resolve_source_metadata(
-            source_worker_id, source_metadata_per_rank
-        )
-
-        self._cleanup_stale_transfer_locks()
-
-        page_size = self._kv_transfer_page_size
-        need_tokens = num_blocks * page_size
-
-        import torch
-
-        local_indices = self.token_to_kv_pool_allocator.alloc(need_tokens)
-        if local_indices is None or (
-            isinstance(local_indices, torch.Tensor) and local_indices.numel() == 0
-        ):
-            raise RuntimeError("Could not allocate local KV pages for transfer")
-
-        try:
-            xfer_handle, local_prep, remote_prep, prep_ms = (
-                self._start_nixl_transfer(
-                    source_metadata, source_kv_indices, local_indices,
-                    num_blocks, page_size, peer_name,
-                )
-            )
-        except Exception:
-            try:
-                self.token_to_kv_pool_allocator.free(local_indices)
-            except Exception:
-                pass
-            raise
-
-        tp_rank = getattr(self, "tp_rank", 0)
-        transfer_id = f"kv_xfer_{time.time_ns()}_{tp_rank}"
-
-        if not hasattr(self, "_pending_kv_transfers"):
-            self._pending_kv_transfers = {}
-
-        self._pending_kv_transfers[transfer_id] = {
-            "xfer_handle": xfer_handle,
-            "local_prep": local_prep,
-            "remote_prep": remote_prep,
-            "local_indices": local_indices,
-            "token_ids": list(token_ids[:need_tokens]),
-            "num_blocks": num_blocks,
-            "page_size": page_size,
-            "completion_file": completion_file,
-            "start_time": time.time(),
-            "timeout_ms": timeout_ms,
-            "prep_ms": prep_ms,
-        }
-
-        logger.info(
-            f"initiate_kv_transfer: {transfer_id} started, "
-            f"{num_blocks} blocks, prep={prep_ms:.1f}ms"
-        )
+    _MAX_PENDING_KV_TRANSFERS = 8
 
     def process_kv_transfers(self):
-        """Poll pending async KV transfers (Phase 2: non-blocking completion).
+        """Poll pending async KV transfers and receive new requests.
 
         Called every scheduler iteration from the wrapped process_input_requests.
-        For each pending transfer:
+
+        Phase A: Drain new transfer requests from the dedicated ZMQ PULL
+        socket (non-blocking). Each request is processed immediately:
+        allocate pages, start RDMA, add to pending dict.
+
+        Phase B: Poll pending RDMA transfers:
         - DONE: release handles, insert into radix tree, write completion file
         - ERR: release handles, free pages, write error to completion file
         - PROC: skip (check again next iteration)
         - Timeout: treat as error
         """
+        # Phase A: Receive new transfer requests from dedicated socket
+        if hasattr(self, "_kv_transfer_recv"):
+            import zmq
+
+            while True:
+                try:
+                    req = self._kv_transfer_recv.recv_pyobj(zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    break
+                self._handle_kv_transfer_request(req)
+
         if not hasattr(self, "_pending_kv_transfers"):
             return
         if not self._pending_kv_transfers:
@@ -769,6 +764,132 @@ def install_kv_transfer_methods(scheduler_class):
                 }, f)
             os.rename(tmp_file, rank_file)
 
+    def _handle_kv_transfer_request(self, req):
+        """Process a KV transfer request received from the dedicated socket.
+
+        Same logic as the old initiate_kv_transfer, but reads parameters
+        from a dict sent by the main process via ZMQ PUSH.
+        """
+        completion_file = req.get("completion_file")
+
+        # Guard 1: Reject if too many concurrent transfers
+        if len(self._pending_kv_transfers) >= _MAX_PENDING_KV_TRANSFERS:
+            self._write_completion_error(
+                completion_file, "Too many pending transfers"
+            )
+            return
+
+        # Guard 2: Skip stale requests (main process already timed out)
+        deadline = req.get("deadline", float("inf"))
+        if time.time() > deadline:
+            logger.warning("Dropping stale KV transfer request")
+            return
+
+        if not getattr(self, "_kv_transfer_enabled", False):
+            self._write_completion_error(
+                completion_file, "KV transfer not initialized"
+            )
+            return
+
+        source_worker_id = req.get("source_worker_id")
+        source_metadata = req.get("source_metadata")  # single-rank dict
+        source_kv_indices = req["source_kv_indices"]
+        token_ids = req["token_ids"]
+        num_blocks = req["num_blocks"]
+        timeout_ms = req.get("timeout_ms", 5000)
+
+        try:
+            source_meta, peer_name = self._resolve_source_metadata(
+                source_worker_id,
+                source_metadata=source_metadata,
+            )
+        except Exception as e:
+            self._write_completion_error(
+                completion_file, f"Metadata resolution failed: {e}"
+            )
+            return
+
+        self._cleanup_stale_transfer_locks()
+
+        page_size = self._kv_transfer_page_size
+        need_tokens = num_blocks * page_size
+
+        import torch
+
+        local_indices = self.token_to_kv_pool_allocator.alloc(need_tokens)
+        if local_indices is None or (
+            isinstance(local_indices, torch.Tensor)
+            and local_indices.numel() == 0
+        ):
+            self._write_completion_error(
+                completion_file,
+                "Could not allocate local KV pages for transfer",
+            )
+            return
+
+        try:
+            xfer_handle, local_prep, remote_prep, prep_ms = (
+                self._start_nixl_transfer(
+                    source_meta,
+                    source_kv_indices,
+                    local_indices,
+                    num_blocks,
+                    page_size,
+                    peer_name,
+                )
+            )
+        except Exception as e:
+            try:
+                self.token_to_kv_pool_allocator.free(local_indices)
+            except Exception:
+                pass
+            self._write_completion_error(
+                completion_file, f"NIXL transfer start failed: {e}"
+            )
+            return
+
+        tp_rank = getattr(self, "tp_rank", 0)
+        transfer_id = f"kv_xfer_{time.time_ns()}_{tp_rank}"
+
+        self._pending_kv_transfers[transfer_id] = {
+            "xfer_handle": xfer_handle,
+            "local_prep": local_prep,
+            "remote_prep": remote_prep,
+            "local_indices": local_indices,
+            "token_ids": list(token_ids[:need_tokens]),
+            "num_blocks": num_blocks,
+            "page_size": page_size,
+            "completion_file": completion_file,
+            "start_time": time.time(),
+            "timeout_ms": timeout_ms,
+            "prep_ms": prep_ms,
+        }
+
+        logger.info(
+            f"_handle_kv_transfer_request: {transfer_id} started, "
+            f"{num_blocks} blocks, prep={prep_ms:.1f}ms"
+        )
+
+    def _write_completion_error(self, completion_file, error_msg):
+        """Write an error status to the completion file for the main process."""
+        if not completion_file:
+            logger.error(
+                f"KV transfer error (no completion file): {error_msg}"
+            )
+            return
+
+        tp_rank = getattr(self, "tp_rank", 0)
+        rank_file = f"{completion_file}.rank{tp_rank}"
+        tmp_file = rank_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump({"status": "error", "message": error_msg}, f)
+            os.rename(tmp_file, rank_file)
+        except Exception as e:
+            logger.error(
+                f"Failed to write completion error file: {e}"
+            )
+
     def _cleanup_stale_transfer_locks(self, max_age_s=30):
         """Release transfer locks older than max_age_s.
 
@@ -803,10 +924,11 @@ def install_kv_transfer_methods(scheduler_class):
     scheduler_class._insert_transferred_blocks = _insert_transferred_blocks
     scheduler_class._execute_nixl_transfer = _execute_nixl_transfer
     scheduler_class._start_nixl_transfer = _start_nixl_transfer
-    scheduler_class.initiate_kv_transfer = initiate_kv_transfer
     scheduler_class.process_kv_transfers = process_kv_transfers
     scheduler_class._complete_kv_transfer = _complete_kv_transfer
     scheduler_class._fail_kv_transfer = _fail_kv_transfer
+    scheduler_class._handle_kv_transfer_request = _handle_kv_transfer_request
+    scheduler_class._write_completion_error = _write_completion_error
     scheduler_class._cleanup_stale_transfer_locks = _cleanup_stale_transfer_locks
 
     # Wrap process_input_requests to poll async transfers every iteration.
@@ -817,7 +939,9 @@ def install_kv_transfer_methods(scheduler_class):
 
     def _process_input_requests_with_kv_poll(self, recv_reqs):
         _original_process_input(self, recv_reqs)
-        if hasattr(self, "_pending_kv_transfers"):
+        # Always call process_kv_transfers — it handles both draining
+        # new requests from the ZMQ socket and polling pending RDMAs.
+        if hasattr(self, "_kv_transfer_enabled"):
             self.process_kv_transfers()
 
     scheduler_class.process_input_requests = _process_input_requests_with_kv_poll

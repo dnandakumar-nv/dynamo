@@ -3,11 +3,10 @@
 
 """KV Transfer Manager — orchestrates cross-worker KV cache transfers.
 
-Runs in the main process. All KV buffer operations are delegated to the
-scheduler process via Engine.collective_rpc(). Since collective_rpc does
-NOT return data (only success/failure), methods that need return values
-use a result_file pattern: pass a temp file path, the scheduler writes
-JSON to it, and we read it back.
+Runs in the main process. Read-only operations (metadata, block queries)
+use Engine.collective_rpc() with the result_file pattern. Transfer
+initiation uses dedicated per-rank ZMQ PUSH sockets for fire-and-forget
+sends (~0ms), bypassing collective_rpc's ~530ms round-trip latency.
 """
 
 from __future__ import annotations
@@ -30,21 +29,21 @@ if TYPE_CHECKING:
 class KvTransferManager:
     """Manages KV cache transfer operations for a single worker.
 
-    Runs in the main process. All KV buffer operations are delegated
-    to the scheduler process via Engine.collective_rpc().
+    Runs in the main process. Read-only operations use collective_rpc;
+    transfer initiation uses dedicated per-rank ZMQ PUSH→PULL sockets.
 
     Owns:
     - Source handler (serves Dynamo RPC for remote workers)
     - Target handler (orchestrates block pull from remote workers)
     - Metadata cache for remote workers' NIXL/KV info
+    - Per-rank ZMQ PUSH sockets for fire-and-forget transfer initiation
 
     TP support
     ----------
-    ``collective_rpc`` dispatches the same kwargs to all TP ranks. To give
-    each rank its own source metadata (NIXL agent, GPU buffer pointers),
-    ``get_local_metadata`` exports metadata from every rank, and
-    ``execute_receive_transfer`` passes the full per-rank list.  Each rank
-    indexes into the list with ``self.tp_rank`` inside ``receive_kv_blocks``.
+    Each TP rank has its own ZMQ PULL socket (bound in the scheduler)
+    and a matching PUSH socket (connected here). Transfer requests are
+    sent per-rank with that rank's source metadata, so no TP broadcast
+    is needed.
 
     Transfer / prefill overlap
     --------------------------
@@ -93,15 +92,44 @@ class KvTransferManager:
     async def initialize(self):
         """Initialize transfer infrastructure inside the scheduler process.
 
-        Calls scheduler RPC to register KV cache memory with NIXL.
+        Calls scheduler RPC to register KV cache memory with NIXL and
+        create per-rank ZMQ PULL sockets. Then connects per-rank PUSH
+        sockets from the main process for fire-and-forget transfer
+        initiation (bypassing collective_rpc on the hot path).
         """
         try:
-            await asyncio.to_thread(
-                self.engine.collective_rpc,
-                "init_kv_transfer",
-                page_size=self.page_size,
+            def _init():
+                # Use _rpc_with_result to get per-rank IPC paths back
+                results = self._rpc_with_result(
+                    "init_kv_transfer",
+                    per_rank=True,
+                    page_size=self.page_size,
+                )
+
+                # Create per-rank PUSH sockets connected to each rank's
+                # PULL socket. These are used by execute_receive_transfer_async
+                # for fire-and-forget transfer initiation (~0ms send).
+                import zmq
+
+                ctx = zmq.Context(1)
+                self._kv_transfer_sockets = []
+                for rank_result in results:
+                    if rank_result.get("status") != "ok":
+                        raise RuntimeError(
+                            f"init_kv_transfer failed on rank: {rank_result}"
+                        )
+                    ipc_path = rank_result["ipc_path"]
+                    sock = ctx.socket(zmq.PUSH)
+                    sock.setsockopt(zmq.SNDHWM, 64)
+                    sock.connect(f"ipc://{ipc_path}")
+                    self._kv_transfer_sockets.append(sock)
+                self._kv_zmq_ctx = ctx
+
+            await asyncio.to_thread(_init)
+            logging.info(
+                f"KV Transfer: initialized with "
+                f"{len(self._kv_transfer_sockets)} rank sockets"
             )
-            logging.info("KV Transfer: scheduler-side initialization complete")
         except Exception as e:
             logging.error(f"KV Transfer: initialization failed: {e}")
             raise
@@ -258,16 +286,13 @@ class KvTransferManager:
     ) -> bool:
         """Execute a non-blocking KV block receive on this worker.
 
-        Two-phase transfer:
-        1. Initiation (~10ms): collective_rpc("initiate_kv_transfer") allocates
-           pages, builds NIXL descriptors, starts RDMA, returns immediately.
-        2. Completion (polled): The scheduler's event loop polls RDMA via
-           process_kv_transfers() each iteration. When done, it writes a
-           completion file that we poll here.
+        Sends transfer requests directly to each TP rank's dedicated ZMQ
+        PULL socket (fire-and-forget, ~0ms). The scheduler drains these
+        in process_kv_transfers(), starts RDMA, and writes completion files.
 
-        This avoids blocking the scheduler for the full 500-800ms RDMA
-        duration. The scheduler remains free to process other requests,
-        RPCs, and batch scheduling during the transfer.
+        This completely bypasses collective_rpc and its ~530ms latency.
+        No _collective_rpc_lock is needed — PUSH sockets are independent
+        per rank and multiple transfers can be sent concurrently.
 
         Returns True on success, raises on failure.
         """
@@ -276,43 +301,40 @@ class KvTransferManager:
         )
         os.close(fd)
 
-        def _initiate():
-            if source_worker_id is not None and source_worker_id in self._scheduler_cached_sources:
-                send_metadata = None
-            else:
-                send_metadata = source_metadata_per_rank
-
-            t0 = time.time()
-            with self._collective_rpc_lock:
-                t_lock = time.time()
-                self.engine.collective_rpc(
-                    "initiate_kv_transfer",
-                    source_worker_id=source_worker_id,
-                    source_metadata_per_rank=send_metadata,
-                    source_kv_indices=source_kv_indices,
-                    token_ids=token_ids,
-                    num_blocks=num_blocks,
-                    timeout_ms=self.transfer_timeout_ms,
-                    completion_file=completion_file,
-                )
-                t_done = time.time()
-
-            if source_worker_id is not None:
-                self._scheduler_cached_sources.add(source_worker_id)
-
-            logging.info(
-                f"initiate_transfer timing: "
-                f"lock_wait={(t_lock - t0) * 1000:.0f}ms "
-                f"rpc={(t_done - t_lock) * 1000:.0f}ms"
-            )
-
         t_start = time.time()
-        await asyncio.to_thread(_initiate)
-        t_init = time.time()
+
+        # Determine whether to send full metadata or rely on cache
+        use_cache = (
+            source_worker_id is not None
+            and source_worker_id in self._scheduler_cached_sources
+        )
+
+        # Send to each rank's PUSH socket (fire-and-forget, ~0ms each)
+        tp_size = len(self._kv_transfer_sockets)
+        deadline = time.time() + self.transfer_timeout_ms / 1000.0
+
+        for rank in range(tp_size):
+            rank_metadata = None if use_cache else source_metadata_per_rank[rank]
+
+            req = {
+                "source_kv_indices": source_kv_indices,
+                "token_ids": token_ids,
+                "num_blocks": num_blocks,
+                "source_metadata": rank_metadata,
+                "source_worker_id": source_worker_id,
+                "completion_file": completion_file,
+                "timeout_ms": self.transfer_timeout_ms,
+                "deadline": deadline,
+            }
+            self._kv_transfer_sockets[rank].send_pyobj(req)
+
+        if source_worker_id is not None:
+            self._scheduler_cached_sources.add(source_worker_id)
+
+        t_sent = time.time()
 
         # Poll completion files from all TP ranks.
         # Each rank writes completion_file.rank{i} when its RDMA finishes.
-        tp_size = getattr(self.config.server_args, "tp_size", 1)
         rank_files = [f"{completion_file}.rank{i}" for i in range(tp_size)]
 
         timeout_s = self.transfer_timeout_ms / 1000.0 + 5.0
@@ -352,8 +374,8 @@ class KvTransferManager:
             t_done = time.time()
             logging.info(
                 f"receive_transfer_async timing: "
-                f"init={(t_init - t_start) * 1000:.0f}ms "
-                f"rdma={(t_done - t_init) * 1000:.0f}ms"
+                f"send={(t_sent - t_start) * 1000:.0f}ms "
+                f"rdma={(t_done - t_sent) * 1000:.0f}ms"
             )
         finally:
             # Clean up temp files
