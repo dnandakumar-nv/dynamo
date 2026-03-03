@@ -454,6 +454,22 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         Ok(())
     }
 
+    /// Get decode elapsed time and output block count for a request before freeing it.
+    /// Returns `(worker, decode_elapsed_secs, output_blocks)` if the request has a
+    /// recorded decode start. Used by the scheduling layer to feed throughput observations.
+    pub fn get_decode_elapsed(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<(WorkerWithDpRank, f64, u32)> {
+        let worker = self.request_to_worker.get(request_id).map(|e| *e)?;
+        let table = self.workers.read();
+        let &idx = table.index.get(&worker)?;
+        let seq = table.slots[idx].1.read();
+        let decode_start = seq.decode_start_time(request_id)?;
+        let output_blocks = seq.output_block_count(request_id);
+        Some((worker, decode_start.elapsed().as_secs_f64(), output_blocks))
+    }
+
     /// Free all blocks associated with a request.
     ///
     /// Note: This operation is idempotent. Calling it multiple times for the same request
@@ -554,6 +570,11 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             dp_rank: worker.dp_rank,
             active_decode_blocks: Some(active_blocks as u64),
             active_prefill_tokens: Some(active_tokens as u64),
+            free_kv_blocks: None,
+            evictable_kv_blocks: None,
+            total_kv_blocks: None,
+            num_running_requests: None,
+            active_requests: None,
         };
 
         self.publisher.publish_load(active_load);

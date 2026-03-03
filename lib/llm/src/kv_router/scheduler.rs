@@ -115,8 +115,88 @@ impl KvScheduler {
             kv_router_config.router_queue_threshold,
             block_size,
             selector,
+            dynamo_kv_router::scheduling::queue::VirtualReservationConfig {
+                enabled: kv_router_config.enable_virtual_reservations,
+                default_osl_blocks: kv_router_config.default_osl_blocks,
+                ttl_ms: kv_router_config.virtual_reservation_ttl_ms,
+            },
+            Arc::new(dynamo_kv_router::scheduling::oracle_metrics::OracleRoutingMetrics::new_unregistered()),
         ));
         let queue_clone = queue.clone();
+
+        // Background task: subscribe to worker ActiveLoad metrics for capacity tracking.
+        {
+            use dynamo_runtime::transports::event_plane::EventSubscriber;
+            use super::protocols::ActiveLoad;
+
+            let queue_for_capacity = queue.clone();
+            let capacity_cancel_token = component.drt().child_token();
+            let capacity_namespace = component.namespace().clone();
+
+            tokio::spawn(async move {
+                let subscriber = match EventSubscriber::for_namespace(
+                    &capacity_namespace,
+                    super::KV_METRICS_SUBJECT,
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to subscribe to kv_metrics for capacity tracking: {e}"
+                        );
+                        return;
+                    }
+                };
+
+                let mut typed_rx = subscriber.typed::<ActiveLoad>();
+                tracing::trace!("capacity subscriber started");
+
+                loop {
+                    tokio::select! {
+                        _ = capacity_cancel_token.cancelled() => {
+                            tracing::trace!("capacity subscriber shutting down");
+                            break;
+                        }
+                        msg = typed_rx.next() => {
+                            match msg {
+                                Some(Ok((_envelope, load))) => {
+                                    if load.free_kv_blocks.is_some() {
+                                        let worker = super::protocols::WorkerWithDpRank::new(
+                                            load.worker_id,
+                                            load.dp_rank,
+                                        );
+                                        queue_for_capacity.update_capacity(worker, &load);
+
+                                        // Emit capacity gauges
+                                        if let (Some(free), Some(evictable)) =
+                                            (load.free_kv_blocks, load.evictable_kv_blocks)
+                                        {
+                                            use crate::kv_router::metrics::WORKER_LOAD_METRICS;
+                                            WORKER_LOAD_METRICS.observe_capacity(
+                                                load.worker_id,
+                                                load.dp_rank,
+                                                "worker",
+                                                free,
+                                                evictable,
+                                                load.num_running_requests.unwrap_or(0),
+                                            );
+                                        }
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    tracing::trace!("Error receiving capacity metric: {e}");
+                                }
+                                None => {
+                                    tracing::debug!("Capacity metrics stream closed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Background task: receive requests and periodically recheck pending
         tokio::spawn(async move {
@@ -166,6 +246,8 @@ impl KvScheduler {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
+        expected_output_tokens: Option<u32>,
+        priority: Option<i32>,
     ) -> Result<SchedulingResponse, KvSchedulerError> {
         #[cfg(feature = "bench")]
         let start = Instant::now();
@@ -183,6 +265,9 @@ impl KvScheduler {
             lora_name,
             priority_jump,
             allowed_worker_ids,
+            expected_output_tokens,
+            priority,
+            worker_capacities: HashMap::new(),
             resp_tx: Some(resp_tx),
         };
 
@@ -224,7 +309,16 @@ impl KvScheduler {
     }
 
     pub async fn free(&self, request_id: &str) -> Result<(), SequenceError> {
-        self.slots.free(&request_id.to_string()).await?;
+        let rid = request_id.to_string();
+        // Capture decode timing before freeing (free() clears the data).
+        if let Some((worker, decode_secs, output_blocks)) = self.slots.get_decode_elapsed(&rid) {
+            if decode_secs > 0.0 && output_blocks > 0 {
+                let output_tokens = output_blocks * self.queue.block_size();
+                self.queue
+                    .observe_completion(&worker, output_tokens, decode_secs);
+            }
+        }
+        self.slots.free(&rid).await?;
         self.queue.update().await;
         Ok(())
     }

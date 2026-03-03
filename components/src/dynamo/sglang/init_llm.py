@@ -162,6 +162,8 @@ async def init_decode(
             config,
             metadata_cache_ttl_s=getattr(dynamo_args, "metadata_cache_ttl_s", 300),
             transfer_timeout_ms=getattr(dynamo_args, "transfer_timeout_ms", 5000),
+            max_pending_kv_transfers=getattr(dynamo_args, "max_pending_kv_transfers", 4),
+            max_nixl_starts_per_poll=getattr(dynamo_args, "max_nixl_starts_per_poll", 2),
         )
         await kv_transfer_manager.initialize()
 

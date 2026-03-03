@@ -484,7 +484,8 @@ impl RouterHandles {
             None
         };
 
-        self.decode_router
+        let (worker, overlap, _transfer_hint) = self
+            .decode_router
             .find_best_match(
                 None,
                 tokens,
@@ -494,12 +495,15 @@ impl RouterHandles {
                 None,
                 0.0,
                 allowed_worker_ids,
+                None, // expected_output_tokens
+                None, // priority
             )
             .await
             .map_err(|e| {
                 tracing::error!(error = ?e, "Decode query failed");
                 QueryRouterResult::ErrQueryFailed
-            })
+            })?;
+        Ok((worker, overlap))
     }
 }
 

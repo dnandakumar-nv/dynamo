@@ -2,12 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use dynamo_tokens::SequenceHash;
 use serde::{Deserialize, Serialize};
 
 use super::config::RouterConfigOverride;
-use crate::protocols::{DpRank, OverlapScores, TransferHint, WorkerId, WorkerWithDpRank};
+use crate::protocols::{
+    ActiveRequestSummary, DpRank, OverlapScores, TransferHint, WorkerId, WorkerWithDpRank,
+};
+
+/// Real-time capacity data for a worker, updated from ActiveLoad metrics.
+#[derive(Debug, Clone)]
+pub struct WorkerCapacity {
+    /// Free KV cache blocks (from allocator).
+    pub free_kv_blocks: u64,
+    /// Evictable KV cache blocks (from tree cache).
+    pub evictable_kv_blocks: u64,
+    /// Total KV cache block capacity.
+    pub total_kv_blocks: u64,
+    /// Number of currently running requests.
+    pub num_running_requests: u32,
+    /// When this capacity data was last updated.
+    pub last_updated: Instant,
+    /// Per-request summaries for effective load computation.
+    pub active_requests: Vec<ActiveRequestSummary>,
+    /// Number of virtual reservations applied since the last real ActiveLoad update.
+    /// Reset to 0 when update_capacity() replaces the entry with real data.
+    pub virtual_reservation_count: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PotentialLoad {
@@ -52,6 +75,15 @@ pub struct SchedulingRequest {
     pub priority_jump: f64,
     /// Optional set of allowed worker IDs to restrict routing decisions (EPP).
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
+    /// Predicted output sequence length from agent_hints.osl.
+    /// Used for memory-aware routing and bin-packing.
+    pub expected_output_tokens: Option<u32>,
+    /// Request priority from agent_hints.priority (lower = higher priority).
+    /// Used for priority-aware worker selection.
+    pub priority: Option<i32>,
+    /// Per-worker capacity data, populated from ActiveLoad metrics.
+    /// Used by the selector for memory-aware routing decisions.
+    pub worker_capacities: HashMap<WorkerWithDpRank, WorkerCapacity>,
     pub resp_tx: Option<tokio::sync::oneshot::Sender<Result<SchedulingResponse, KvSchedulerError>>>,
 }
 

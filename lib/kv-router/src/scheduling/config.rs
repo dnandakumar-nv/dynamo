@@ -117,6 +117,72 @@ pub struct KvRouterConfig {
     /// Default: 256
     #[validate(range(min = 1))]
     pub max_transfer_blocks: u32,
+
+    /// Weight for memory pressure in transfer cost (default: 1.0).
+    /// Higher = more penalty for routing to memory-constrained workers.
+    /// Only active when `enable_kv_transfer` is true and capacity data is available.
+    #[validate(range(min = 0.0))]
+    pub memory_pressure_weight: f64,
+
+    /// Enable OSL-weighted effective load in cost function (default: false).
+    /// When true and worker capacity reports include per-request summaries,
+    /// replaces raw decode_blocks with a predictive load estimate.
+    pub use_effective_load: bool,
+
+    /// Weight for contention from higher-priority in-flight requests (default: 1.3).
+    /// Requests with priority lower (= higher urgency) than the new request
+    /// contribute this multiplier to the effective load.
+    #[validate(range(min = 0.0))]
+    pub high_priority_contention_weight: f64,
+
+    /// Weight for contention from lower-priority in-flight requests (default: 0.7).
+    /// Requests with priority higher (= lower urgency) than the new request
+    /// contribute this multiplier to the effective load.
+    #[validate(range(min = 0.0))]
+    pub low_priority_contention_weight: f64,
+
+    /// Weight for future headroom bonus in cost function (default: 0.0 = disabled).
+    /// Higher values make the router prefer workers where in-flight requests
+    /// are about to finish. Subtracts headroom_weight * headroom_ratio from logit.
+    #[validate(range(min = 0.0))]
+    pub headroom_weight: f64,
+
+    /// Default per-request decode throughput estimate in tokens/sec (default: 30.0).
+    /// Used by ThroughputEstimator when no observations are available for a worker.
+    #[validate(range(min = 1.0))]
+    pub default_decode_tps: f64,
+
+    /// EMA smoothing factor for throughput estimator (default: 0.1).
+    /// Higher = more responsive to recent observations, lower = smoother.
+    #[validate(range(min = 0.01, max = 1.0))]
+    pub throughput_ema_alpha: f64,
+
+    /// Priority threshold: requests with priority <= this are "high priority" (default: 5).
+    /// High-priority requests get boosted headroom weight and reduced overlap weight.
+    /// Only active when `priority_adaptive_weights` is true.
+    pub high_priority_threshold: i32,
+
+    /// Enable priority-adaptive weight adjustment (default: false).
+    /// When enabled, high-priority requests trade cache-hit probability for faster
+    /// scheduling, while normal-priority requests use default weights.
+    pub priority_adaptive_weights: bool,
+
+    /// Enable virtual capacity reservations (default: false).
+    /// After routing a request, immediately deducts predicted resource usage
+    /// from the local capacity model so the next request sees reduced free blocks.
+    /// Real ActiveLoad updates from workers overwrite virtual adjustments.
+    pub enable_virtual_reservations: bool,
+
+    /// Default predicted output length in blocks when expected_output_tokens is not provided.
+    /// Used for virtual reservations. Default: 16 blocks (= 256 tokens at block_size=16).
+    #[validate(range(min = 1))]
+    pub default_osl_blocks: u32,
+
+    /// TTL for virtual reservations in milliseconds (default: 500).
+    /// If no real ActiveLoad arrives within this duration after a virtual reservation
+    /// was applied, the stale reservation count is reset.
+    #[validate(range(min = 50))]
+    pub virtual_reservation_ttl_ms: u64,
 }
 
 impl Default for KvRouterConfig {
@@ -142,6 +208,18 @@ impl Default for KvRouterConfig {
             transfer_cost_weight: 0.1,
             min_transfer_queue_advantage: 8,
             max_transfer_blocks: 256,
+            memory_pressure_weight: 1.0,
+            use_effective_load: false,
+            high_priority_contention_weight: 1.3,
+            low_priority_contention_weight: 0.7,
+            headroom_weight: 0.0,
+            default_decode_tps: 30.0,
+            throughput_ema_alpha: 0.1,
+            high_priority_threshold: 5,
+            priority_adaptive_weights: false,
+            enable_virtual_reservations: false,
+            default_osl_blocks: 16,
+            virtual_reservation_ttl_ms: 500,
         }
     }
 }

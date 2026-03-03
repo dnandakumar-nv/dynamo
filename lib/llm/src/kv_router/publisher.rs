@@ -1193,6 +1193,11 @@ impl<'de> Visitor<'de> for RawKvEventVisitor {
 struct WorkerMetrics {
     dp_rank: DpRank,
     active_decode_blocks: u64,
+    free_kv_blocks: Option<u64>,
+    evictable_kv_blocks: Option<u64>,
+    total_kv_blocks: Option<u64>,
+    num_running_requests: Option<u32>,
+    active_requests: Option<Vec<ActiveRequestSummary>>,
 }
 
 pub struct WorkerMetricsPublisher {
@@ -1215,6 +1220,11 @@ impl WorkerMetricsPublisher {
         let metrics = WorkerMetrics {
             dp_rank: dp_rank.unwrap_or(0),
             active_decode_blocks,
+            free_kv_blocks: None,
+            evictable_kv_blocks: None,
+            total_kv_blocks: None,
+            num_running_requests: None,
+            active_requests: None,
         };
         tracing::trace!(
             "Publish metrics: dp_rank={}, active_decode_blocks={}",
@@ -1224,6 +1234,55 @@ impl WorkerMetricsPublisher {
         self.tx
             .send(metrics)
             .map_err(|_| anyhow::anyhow!("metrics channel closed"))
+    }
+
+    /// Publish extended worker metrics including KV cache capacity.
+    pub fn publish_with_capacity(
+        &self,
+        dp_rank: Option<DpRank>,
+        active_decode_blocks: u64,
+        free_kv_blocks: u64,
+        evictable_kv_blocks: u64,
+        total_kv_blocks: u64,
+        num_running_requests: u32,
+    ) -> Result<()> {
+        let metrics = WorkerMetrics {
+            dp_rank: dp_rank.unwrap_or(0),
+            active_decode_blocks,
+            free_kv_blocks: Some(free_kv_blocks),
+            evictable_kv_blocks: Some(evictable_kv_blocks),
+            total_kv_blocks: Some(total_kv_blocks),
+            num_running_requests: Some(num_running_requests),
+            active_requests: None,
+        };
+        tracing::trace!(
+            dp_rank = metrics.dp_rank,
+            active_decode_blocks = metrics.active_decode_blocks,
+            free_kv_blocks,
+            evictable_kv_blocks,
+            total_kv_blocks,
+            num_running_requests,
+            "Publish metrics with capacity",
+        );
+        self.tx
+            .send(metrics)
+            .map_err(|_| anyhow::anyhow!("metrics channel closed"))
+    }
+
+    /// Publish per-request summaries for effective load computation.
+    /// Updates the active_requests field on the existing metrics without changing other values.
+    pub fn publish_active_requests(
+        &self,
+        dp_rank: Option<DpRank>,
+        active_requests: Vec<ActiveRequestSummary>,
+    ) -> Result<()> {
+        self.tx.send_modify(|m| {
+            if let Some(dp) = dp_rank {
+                m.dp_rank = dp;
+            }
+            m.active_requests = Some(active_requests);
+        });
+        Ok(())
     }
 
     pub async fn create_endpoint(&self, component: Component) -> Result<()> {
@@ -1291,6 +1350,11 @@ impl WorkerMetricsPublisher {
                                 dp_rank: metrics.dp_rank,
                                 active_decode_blocks: Some(metrics.active_decode_blocks),
                                 active_prefill_tokens: None,
+                                free_kv_blocks: metrics.free_kv_blocks,
+                                evictable_kv_blocks: metrics.evictable_kv_blocks,
+                                total_kv_blocks: metrics.total_kv_blocks,
+                                num_running_requests: metrics.num_running_requests,
+                                active_requests: metrics.active_requests.clone(),
                             };
 
                             if let Err(e) = event_publisher.publish(&active_load).await {

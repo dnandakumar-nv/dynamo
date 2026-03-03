@@ -43,7 +43,13 @@ def install_kv_transfer_methods(scheduler_class):
     getattr(self, method_name)(**params).
     """
 
-    def init_kv_transfer(self, page_size=16, result_file=None):
+    def init_kv_transfer(
+        self,
+        page_size=16,
+        result_file=None,
+        max_pending_kv_transfers=4,
+        max_nixl_starts_per_poll=2,
+    ):
         """Initialize NIXL transfer infrastructure.
 
         Registers KV cache GPU memory with NIXL agent for remote reads.
@@ -121,6 +127,14 @@ def install_kv_transfer_methods(scheduler_class):
         # Populated by _handle_kv_transfer_request, drained by
         # process_kv_transfers.
         self._pending_kv_transfers = {}
+
+        # Transfer page budget: tracks tokens held by in-flight RDMA
+        # transfers (allocated but not yet inserted into radix tree).
+        self._transfer_pages_held = 0
+
+        # Configurable concurrency limits (from CLI flags)
+        self._max_pending_kv_transfers = max_pending_kv_transfers
+        self._max_nixl_starts_per_poll = max_nixl_starts_per_poll
 
         # Create dedicated ZMQ PULL socket for receiving KV transfer
         # requests directly from the main process (bypasses collective_rpc).
@@ -328,18 +342,27 @@ def install_kv_transfer_methods(scheduler_class):
             source_worker_id, source_metadata_per_rank
         )
 
-        self._cleanup_stale_transfer_locks()
-
         page_size = self._kv_transfer_page_size
         need_tokens = num_blocks * page_size
 
-        import torch
+        # Budget check: prevent transfers from starving normal requests
+        max_transfer_tokens = int(
+            self.token_to_kv_pool_allocator.size * _TRANSFER_BUDGET_FRACTION
+        )
+        if self._transfer_pages_held + need_tokens > max_transfer_tokens:
+            raise RuntimeError(
+                f"Transfer page budget exceeded "
+                f"({self._transfer_pages_held + need_tokens} > "
+                f"{max_transfer_tokens})"
+            )
 
-        local_indices = self.token_to_kv_pool_allocator.alloc(need_tokens)
-        if local_indices is None or (
-            isinstance(local_indices, torch.Tensor) and local_indices.numel() == 0
-        ):
-            raise RuntimeError("Could not allocate local KV pages for transfer")
+        local_indices = self._alloc_with_eviction(need_tokens)
+        if local_indices is None:
+            raise RuntimeError(
+                f"Could not allocate local KV pages for transfer "
+                f"(need {need_tokens}, "
+                f"avail {self.token_to_kv_pool_allocator.available_size()})"
+            )
 
         try:
             self._execute_nixl_transfer(
@@ -641,8 +664,6 @@ def install_kv_transfer_methods(scheduler_class):
                     pass
             raise
 
-    _MAX_PENDING_KV_TRANSFERS = 8
-
     def process_kv_transfers(self):
         """Poll pending async KV transfers and receive new requests.
 
@@ -658,16 +679,30 @@ def install_kv_transfer_methods(scheduler_class):
         - PROC: skip (check again next iteration)
         - Timeout: treat as error
         """
-        # Phase A: Receive new transfer requests from dedicated socket
+        # Phase A: Receive new transfer requests from dedicated socket.
+        # Rate-limit RDMA starts to avoid overwhelming the NIXL/RDMA layer
+        # with burst traffic. Excess messages are drained from ZMQ but
+        # rejected immediately so senders fall back to full prefill fast.
         if hasattr(self, "_kv_transfer_recv"):
             import zmq
 
+            nixl_starts = 0
             while True:
                 try:
                     req = self._kv_transfer_recv.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                if nixl_starts >= self._max_nixl_starts_per_poll:
+                    # Drain but reject — too many RDMA starts this iteration
+                    self._write_completion_error(
+                        req.get("completion_file"),
+                        "Transfer rate limited (burst)",
+                    )
+                    continue
+                pending_before = len(self._pending_kv_transfers)
                 self._handle_kv_transfer_request(req)
+                if len(self._pending_kv_transfers) > pending_before:
+                    nixl_starts += 1
 
         if not hasattr(self, "_pending_kv_transfers"):
             return
@@ -708,6 +743,11 @@ def install_kv_transfer_methods(scheduler_class):
         for transfer_id in completed:
             del self._pending_kv_transfers[transfer_id]
 
+        # Phase C: Periodic cleanup of stale transfer locks.
+        # Releases locks from completed transfers whose requests have
+        # arrived (or never will), keeping evictable pool pages available.
+        self._cleanup_stale_transfer_locks()
+
     def _complete_kv_transfer(self, transfer_id, state):
         """Handle successful RDMA completion for an async transfer.
 
@@ -723,6 +763,13 @@ def install_kv_transfer_methods(scheduler_class):
                     handle.release()
                 except Exception:
                     pass
+
+        # Release transfer page budget before insertion (pages transfer
+        # ownership from "in-flight budget" to "radix tree")
+        released_tokens = state["num_blocks"] * state["page_size"]
+        self._transfer_pages_held = max(
+            0, self._transfer_pages_held - released_tokens
+        )
 
         # Insert into radix tree with eviction protection
         self._insert_transferred_blocks(
@@ -772,11 +819,15 @@ def install_kv_transfer_methods(scheduler_class):
                 except Exception:
                     pass
 
-        # Free allocated pages
+        # Free allocated pages and release transfer page budget
         try:
             self.token_to_kv_pool_allocator.free(state["local_indices"])
         except Exception:
             pass
+        released_tokens = state["num_blocks"] * state["page_size"]
+        self._transfer_pages_held = max(
+            0, self._transfer_pages_held - released_tokens
+        )
 
         logger.error(
             f"process_kv_transfers: failed {transfer_id}: {error_msg}"
@@ -805,7 +856,7 @@ def install_kv_transfer_methods(scheduler_class):
         completion_file = req.get("completion_file")
 
         # Guard 1: Reject if too many concurrent transfers
-        if len(self._pending_kv_transfers) >= _MAX_PENDING_KV_TRANSFERS:
+        if len(self._pending_kv_transfers) >= self._max_pending_kv_transfers:
             self._write_completion_error(
                 completion_file, "Too many pending transfers"
             )
@@ -841,23 +892,33 @@ def install_kv_transfer_methods(scheduler_class):
             )
             return
 
-        self._cleanup_stale_transfer_locks()
-
         page_size = self._kv_transfer_page_size
         need_tokens = num_blocks * page_size
 
-        import torch
-
-        local_indices = self.token_to_kv_pool_allocator.alloc(need_tokens)
-        if local_indices is None or (
-            isinstance(local_indices, torch.Tensor)
-            and local_indices.numel() == 0
-        ):
+        # Budget check: prevent transfers from starving normal requests
+        max_transfer_tokens = int(
+            self.token_to_kv_pool_allocator.size * _TRANSFER_BUDGET_FRACTION
+        )
+        if self._transfer_pages_held + need_tokens > max_transfer_tokens:
             self._write_completion_error(
                 completion_file,
-                "Could not allocate local KV pages for transfer",
+                f"Transfer page budget exceeded "
+                f"({self._transfer_pages_held + need_tokens} > "
+                f"{max_transfer_tokens})",
             )
             return
+
+        local_indices = self._alloc_with_eviction(need_tokens)
+        if local_indices is None:
+            self._write_completion_error(
+                completion_file,
+                f"Could not allocate local KV pages for transfer "
+                f"(need {need_tokens}, "
+                f"avail {self.token_to_kv_pool_allocator.available_size()})",
+            )
+            return
+
+        self._transfer_pages_held += need_tokens
 
         try:
             xfer_handle, local_prep, remote_prep, prep_ms = (
@@ -875,6 +936,9 @@ def install_kv_transfer_methods(scheduler_class):
                 self.token_to_kv_pool_allocator.free(local_indices)
             except Exception:
                 pass
+            self._transfer_pages_held = max(
+                0, self._transfer_pages_held - need_tokens
+            )
             self._write_completion_error(
                 completion_file, f"NIXL transfer start failed: {e}"
             )
@@ -922,7 +986,89 @@ def install_kv_transfer_methods(scheduler_class):
                 f"Failed to write completion error file: {e}"
             )
 
-    def _cleanup_stale_transfer_locks(self, max_age_s=30):
+    # Maximum fraction of KV pool that transfers may consume.
+    # Prevents transfer bursts from starving normal request processing.
+    _TRANSFER_BUDGET_FRACTION = 0.5
+
+    def _alloc_with_eviction(self, need_tokens):
+        """Allocate KV pages for transfer, evicting cache entries if needed.
+
+        Mirrors SGLang's evict_from_tree_cache() pattern:
+        1. Check available_size()
+        2. If insufficient, release stale transfer locks (aggressive, 3s)
+        3. If still insufficient, evict LRU leaves from radix tree
+        4. Attempt allocation
+        5. If still fails, nuclear fallback: release ALL locks, evict again
+
+        Returns tensor of page indices, or None if truly out of memory.
+        """
+        import torch
+
+        allocator = self.token_to_kv_pool_allocator
+
+        # Fast path: enough free pages already
+        result = allocator.alloc(need_tokens)
+        if result is not None and not (
+            isinstance(result, torch.Tensor) and result.numel() == 0
+        ):
+            return result
+
+        # Step 1: Release stale transfer locks aggressively (3s not 30s).
+        # This unlocks radix tree nodes from completed transfers whose
+        # requests have already arrived, making them evictable.
+        self._cleanup_stale_transfer_locks(max_age_s=3)
+
+        # Step 2: Evict from radix tree if still insufficient
+        available = allocator.available_size()
+        if available < need_tokens:
+            shortfall = need_tokens - available
+            # Request 2x shortfall to leave headroom for the next transfer
+            evict_target = shortfall * 2
+            try:
+                from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+                evict_result = self.tree_cache.evict(
+                    EvictParams(num_tokens=evict_target)
+                )
+                if evict_result.num_tokens_evicted > 0:
+                    logger.info(
+                        f"Transfer alloc: evicted "
+                        f"{evict_result.num_tokens_evicted} tokens from "
+                        f"radix tree (needed {need_tokens}, had {available})"
+                    )
+            except Exception as e:
+                logger.warning(f"Transfer alloc: eviction failed: {e}")
+
+        # Step 3: Attempt allocation
+        result = allocator.alloc(need_tokens)
+        if result is not None and not (
+            isinstance(result, torch.Tensor) and result.numel() == 0
+        ):
+            return result
+
+        # Step 4: Nuclear fallback — release ALL transfer locks and
+        # evict again. This sacrifices recently-transferred cache entries
+        # to make room for the current transfer.
+        self._cleanup_stale_transfer_locks(max_age_s=0)
+        available = allocator.available_size()
+        if available < need_tokens:
+            try:
+                from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+                self.tree_cache.evict(
+                    EvictParams(num_tokens=need_tokens - available)
+                )
+            except Exception:
+                pass
+        result = allocator.alloc(need_tokens)
+        if result is not None and not (
+            isinstance(result, torch.Tensor) and result.numel() == 0
+        ):
+            return result
+
+        return None
+
+    def _cleanup_stale_transfer_locks(self, max_age_s=5):
         """Release transfer locks older than max_age_s.
 
         Transferred blocks are locked (inc_lock_ref) to prevent eviction
@@ -961,6 +1107,7 @@ def install_kv_transfer_methods(scheduler_class):
     scheduler_class._fail_kv_transfer = _fail_kv_transfer
     scheduler_class._handle_kv_transfer_request = _handle_kv_transfer_request
     scheduler_class._write_completion_error = _write_completion_error
+    scheduler_class._alloc_with_eviction = _alloc_with_eviction
     scheduler_class._cleanup_stale_transfer_locks = _cleanup_stale_transfer_locks
 
     # Wrap process_input_requests to poll async transfers every iteration.

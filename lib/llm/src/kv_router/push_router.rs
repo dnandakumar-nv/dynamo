@@ -257,6 +257,7 @@ impl KvPushRouter {
         let priority_jump = routing.and_then(|r| r.priority_jump).unwrap_or(0.0);
         let dp_rank = routing.and_then(|r| r.dp_rank).unwrap_or(0);
         let expected_output_tokens = routing.and_then(|r| r.expected_output_tokens);
+        let priority = routing.and_then(|r| r.priority);
         let allowed_worker_ids = routing.and_then(|r| r.allowed_worker_ids.clone());
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
 
@@ -283,6 +284,8 @@ impl KvPushRouter {
                     lora_name,
                     priority_jump,
                     allowed_worker_ids,
+                    expected_output_tokens,
+                    priority,
                 )
                 .await?;
 

@@ -71,6 +71,12 @@ fn overhead_buckets() -> Vec<f64> {
 pub struct WorkerLoadMetrics {
     pub active_decode_blocks: IntGaugeVec,
     pub active_prefill_tokens: IntGaugeVec,
+    /// Free KV cache blocks per worker (from ActiveLoad capacity reports).
+    pub free_kv_blocks: IntGaugeVec,
+    /// Evictable KV cache blocks per worker.
+    pub evictable_kv_blocks: IntGaugeVec,
+    /// Number of running requests per worker.
+    pub running_requests: IntGaugeVec,
 }
 
 impl WorkerLoadMetrics {
@@ -91,6 +97,29 @@ impl WorkerLoadMetrics {
         self.active_prefill_tokens
             .with_label_values(labels)
             .set(active_tokens as i64);
+    }
+
+    pub fn observe_capacity(
+        &self,
+        worker_id: u64,
+        dp_rank: u32,
+        worker_type: &str,
+        free_blocks: u64,
+        evictable_blocks: u64,
+        running_reqs: u32,
+    ) {
+        let worker_id_str = worker_id.to_string();
+        let dp_rank_str = dp_rank.to_string();
+        let labels = &[worker_id_str.as_str(), dp_rank_str.as_str(), worker_type];
+        self.free_kv_blocks
+            .with_label_values(labels)
+            .set(free_blocks as i64);
+        self.evictable_kv_blocks
+            .with_label_values(labels)
+            .set(evictable_blocks as i64);
+        self.running_requests
+            .with_label_values(labels)
+            .set(running_reqs as i64);
     }
 }
 
@@ -119,6 +148,42 @@ pub static WORKER_LOAD_METRICS: LazyLock<WorkerLoadMetrics> = LazyLock::new(|| W
         &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
     )
     .expect("Failed to create worker_active_prefill_tokens gauge"),
+    free_kv_blocks: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_FREE_KV_BLOCKS
+            ),
+            "Free KV cache blocks per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_free_kv_blocks gauge"),
+    evictable_kv_blocks: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_EVICTABLE_KV_BLOCKS
+            ),
+            "Evictable KV cache blocks per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_evictable_kv_blocks gauge"),
+    running_requests: IntGaugeVec::new(
+        Opts::new(
+            format!(
+                "{}_{}",
+                name_prefix::FRONTEND,
+                frontend_service::WORKER_RUNNING_REQUESTS
+            ),
+            "Running requests per worker",
+        ),
+        &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+    )
+    .expect("Failed to create worker_running_requests gauge"),
 });
 
 /// Register the worker load gauges with the given Prometheus registry.
@@ -129,6 +194,9 @@ pub fn register_worker_load_metrics(
     let m = &*WORKER_LOAD_METRICS;
     registry.register(Box::new(m.active_decode_blocks.clone()))?;
     registry.register(Box::new(m.active_prefill_tokens.clone()))?;
+    registry.register(Box::new(m.free_kv_blocks.clone()))?;
+    registry.register(Box::new(m.evictable_kv_blocks.clone()))?;
+    registry.register(Box::new(m.running_requests.clone()))?;
     Ok(())
 }
 
@@ -537,6 +605,42 @@ mod tests {
                         frontend_service::WORKER_ACTIVE_PREFILL_TOKENS
                     ),
                     "Active prefill tokens queued per worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            free_kv_blocks: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_FREE_KV_BLOCKS
+                    ),
+                    "Free KV cache blocks per worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            evictable_kv_blocks: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_EVICTABLE_KV_BLOCKS
+                    ),
+                    "Evictable KV cache blocks per worker",
+                ),
+                &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
+            )
+            .unwrap(),
+            running_requests: IntGaugeVec::new(
+                Opts::new(
+                    format!(
+                        "{}_{}",
+                        name_prefix::FRONTEND,
+                        frontend_service::WORKER_RUNNING_REQUESTS
+                    ),
+                    "Running requests per worker",
                 ),
                 &[labels::WORKER_ID, labels::DP_RANK, labels::WORKER_TYPE],
             )

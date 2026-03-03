@@ -197,6 +197,17 @@ pub struct WorkerSelectionResult {
     pub transfer_hint: Option<TransferHint>,
 }
 
+/// Per-request summary for computing effective decode load.
+/// Published by workers alongside capacity data.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ActiveRequestSummary {
+    pub isl_tokens: u32,
+    pub generated_tokens: u32,
+    pub max_new_tokens: u32,
+    pub priority: i32,
+    pub is_prefill: bool,
+}
+
 /// Active load metrics for a worker, used for busy detection.
 ///
 /// Published by workers (with only `active_decode_blocks`) and by the scheduler
@@ -210,6 +221,21 @@ pub struct ActiveLoad {
     pub active_decode_blocks: Option<u64>,
     /// Number of active prefill tokens (from scheduler's view).
     pub active_prefill_tokens: Option<u64>,
+    /// Free KV cache blocks on the worker (allocator available).
+    #[serde(default)]
+    pub free_kv_blocks: Option<u64>,
+    /// Evictable KV cache blocks (tree cache evictable).
+    #[serde(default)]
+    pub evictable_kv_blocks: Option<u64>,
+    /// Total KV cache blocks capacity.
+    #[serde(default)]
+    pub total_kv_blocks: Option<u64>,
+    /// Number of currently running requests.
+    #[serde(default)]
+    pub num_running_requests: Option<u32>,
+    /// Per-request summaries for effective load computation.
+    #[serde(default)]
+    pub active_requests: Option<Vec<ActiveRequestSummary>>,
 }
 
 /// A [`LocalBlockHash`] is a hash computed from the token IDs, optional multimodal metadata,
@@ -939,5 +965,75 @@ mod tests {
         assert_eq!(deserialized.block_hashes.len(), 2);
         assert_eq!(deserialized.block_hashes[0].0, 4);
         assert_eq!(deserialized.block_hashes[1].0, 5);
+    }
+
+    #[test]
+    fn test_active_load_serde_backward_compat() {
+        // Old format without capacity fields should deserialize successfully
+        let json = r#"{"worker_id":1,"dp_rank":0,"active_decode_blocks":100}"#;
+        let load: ActiveLoad = serde_json::from_str(json).unwrap();
+        assert_eq!(load.worker_id, 1);
+        assert_eq!(load.active_decode_blocks, Some(100));
+        assert_eq!(load.free_kv_blocks, None);
+        assert_eq!(load.evictable_kv_blocks, None);
+        assert_eq!(load.total_kv_blocks, None);
+        assert_eq!(load.num_running_requests, None);
+        assert_eq!(load.active_requests, None);
+    }
+
+    #[test]
+    fn test_active_load_serde_with_capacity() {
+        let load = ActiveLoad {
+            worker_id: 1,
+            dp_rank: 0,
+            active_decode_blocks: Some(100),
+            active_prefill_tokens: Some(5000),
+            free_kv_blocks: Some(500),
+            evictable_kv_blocks: Some(200),
+            total_kv_blocks: Some(1000),
+            num_running_requests: Some(5),
+            active_requests: None,
+        };
+        let json = serde_json::to_string(&load).unwrap();
+        let deserialized: ActiveLoad = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, load);
+    }
+
+    #[test]
+    fn test_active_load_serde_with_active_requests() {
+        let load = ActiveLoad {
+            worker_id: 1,
+            dp_rank: 0,
+            active_decode_blocks: Some(100),
+            active_prefill_tokens: None,
+            free_kv_blocks: Some(500),
+            evictable_kv_blocks: Some(200),
+            total_kv_blocks: Some(1000),
+            num_running_requests: Some(3),
+            active_requests: Some(vec![
+                ActiveRequestSummary {
+                    isl_tokens: 100,
+                    generated_tokens: 50,
+                    max_new_tokens: 500,
+                    priority: 1,
+                    is_prefill: false,
+                },
+            ]),
+        };
+        let json = serde_json::to_string(&load).unwrap();
+        let deserialized: ActiveLoad = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.active_requests.as_ref().unwrap().len(), 1);
+        assert_eq!(
+            deserialized.active_requests.as_ref().unwrap()[0].isl_tokens,
+            100
+        );
+    }
+
+    #[test]
+    fn test_active_load_serde_backward_compat_no_active_requests() {
+        // Old-format JSON without active_requests should deserialize to None.
+        let json = r#"{"worker_id":1,"active_decode_blocks":100}"#;
+        let load: ActiveLoad = serde_json::from_str(json).unwrap();
+        assert!(load.active_requests.is_none());
     }
 }

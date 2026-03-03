@@ -119,6 +119,23 @@ class DynamoSGLangArgGroup(ArgGroup):
             arg_type=int,
             help="Metadata cache TTL in seconds for remote worker NIXL info (default: 300).",
         )
+        add_argument(
+            g,
+            flag_name="--max-pending-kv-transfers",
+            env_var="DYN_SGL_MAX_PENDING_KV_TRANSFERS",
+            default=4,
+            arg_type=int,
+            help="Max concurrent RDMA transfers per scheduler (default: 4).",
+        )
+        add_argument(
+            g,
+            flag_name="--max-nixl-starts-per-poll",
+            env_var="DYN_SGL_MAX_NIXL_STARTS_PER_POLL",
+            default=2,
+            arg_type=int,
+            help="Max new RDMA transfers started per scheduler iteration (default: 2). "
+            "Prevents burst traffic from overwhelming the NIXL/RDMA layer.",
+        )
         add_negatable_bool_argument(
             g,
             flag_name="--enable-transfer-overlap",
@@ -145,6 +162,8 @@ class DynamoSGLangConfig(ConfigBase):
     enable_kv_transfer: bool = False
     transfer_timeout_ms: int = 5000
     metadata_cache_ttl_s: int = 300
+    max_pending_kv_transfers: int = 4
+    max_nixl_starts_per_poll: int = 2
     enable_transfer_overlap: bool = False
 
     def validate(self) -> None:

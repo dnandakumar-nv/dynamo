@@ -135,7 +135,35 @@ class DynamoSglangPublisher:
                     else self.dp_rank
                 )
                 active_decode_blocks = kv_metrics.kv_active_blocks
-                self.metrics_publisher.publish(dp_rank, active_decode_blocks)
+                # Use extended publish if capacity data is available,
+                # otherwise fall back to basic publish for backward compat.
+                if getattr(kv_metrics, "kv_free_blocks", None) is not None:
+                    self.metrics_publisher.publish_with_capacity(
+                        dp_rank,
+                        active_decode_blocks,
+                        kv_metrics.kv_free_blocks,
+                        getattr(kv_metrics, "kv_evictable_blocks", None) or 0,
+                        kv_metrics.kv_total_blocks or 0,
+                        getattr(kv_metrics, "num_running_requests", None) or 0,
+                    )
+                else:
+                    self.metrics_publisher.publish(dp_rank, active_decode_blocks)
+                # Forward per-request summaries for effective load computation
+                active_requests = getattr(kv_metrics, "active_requests", None)
+                if active_requests:
+                    summaries = [
+                        {
+                            "isl_tokens": s.isl_tokens,
+                            "generated_tokens": s.generated_tokens,
+                            "max_new_tokens": s.max_new_tokens,
+                            "priority": s.priority,
+                            "is_prefill": s.is_prefill,
+                        }
+                        for s in active_requests
+                    ]
+                    self.metrics_publisher.publish_active_requests(
+                        dp_rank, summaries
+                    )
                 dp_rank_str = str(dp_rank)
                 # Publish total blocks (always available in KvMetrics)
                 self.component_gauges.set_total_blocks(

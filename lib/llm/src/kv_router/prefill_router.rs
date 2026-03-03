@@ -540,6 +540,8 @@ impl PrefillRouter {
                         lora_name,
                         priority_jump,
                         allowed_worker_ids,
+                        None, // expected_output_tokens - not available in prefill path
+                        None, // priority - not available in prefill path
                     )
                     .await?;
                 Ok((worker.worker_id, worker.dp_rank))

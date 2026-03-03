@@ -120,6 +120,68 @@ impl WorkerMetricsPublisher {
             .publish(dp_rank, active_decode_blocks)
             .map_err(to_pyerr)
     }
+
+    /// Publish extended worker metrics including KV cache capacity.
+    #[pyo3(signature = (dp_rank, active_decode_blocks, free_kv_blocks, evictable_kv_blocks, total_kv_blocks, num_running_requests))]
+    fn publish_with_capacity(
+        &self,
+        dp_rank: Option<u32>,
+        active_decode_blocks: u64,
+        free_kv_blocks: u64,
+        evictable_kv_blocks: u64,
+        total_kv_blocks: u64,
+        num_running_requests: u32,
+    ) -> PyResult<()> {
+        self.inner
+            .publish_with_capacity(
+                dp_rank,
+                active_decode_blocks,
+                free_kv_blocks,
+                evictable_kv_blocks,
+                total_kv_blocks,
+                num_running_requests,
+            )
+            .map_err(to_pyerr)
+    }
+
+    /// Publish per-request summaries for effective load computation.
+    /// Each summary is a dict with keys: isl_tokens, generated_tokens, max_new_tokens, priority, is_prefill.
+    #[pyo3(signature = (dp_rank, active_requests))]
+    fn publish_active_requests(
+        &self,
+        dp_rank: Option<u32>,
+        active_requests: Vec<HashMap<String, Bound<'_, PyAny>>>,
+    ) -> PyResult<()> {
+        let summaries: Vec<ActiveRequestSummary> = active_requests
+            .iter()
+            .map(|d| ActiveRequestSummary {
+                isl_tokens: d
+                    .get("isl_tokens")
+                    .and_then(|v| v.extract::<u32>().ok())
+                    .unwrap_or(0),
+                generated_tokens: d
+                    .get("generated_tokens")
+                    .and_then(|v| v.extract::<u32>().ok())
+                    .unwrap_or(0),
+                max_new_tokens: d
+                    .get("max_new_tokens")
+                    .and_then(|v| v.extract::<u32>().ok())
+                    .unwrap_or(0),
+                priority: d
+                    .get("priority")
+                    .and_then(|v| v.extract::<i32>().ok())
+                    .unwrap_or(0),
+                is_prefill: d
+                    .get("is_prefill")
+                    .and_then(|v| v.extract::<bool>().ok())
+                    .unwrap_or(false),
+            })
+            .collect();
+
+        self.inner
+            .publish_active_requests(dp_rank, summaries)
+            .map_err(to_pyerr)
+    }
 }
 
 #[pyclass]
@@ -923,6 +985,8 @@ impl KvRouter {
                     lora_name,
                     0.0,
                     None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
+                    None, // expected_output_tokens
+                    None, // priority
                 )
                 .await
                 .map_err(to_pyerr)?;

@@ -69,6 +69,18 @@ class FrontendConfig(ConfigBase):
     transfer_cost_weight: float
     min_transfer_queue_advantage: int
     max_transfer_blocks: int
+    memory_pressure_weight: float
+    use_effective_load: bool
+    high_priority_contention_weight: float
+    low_priority_contention_weight: float
+    headroom_weight: float
+    default_decode_tps: float
+    throughput_ema_alpha: float
+    high_priority_threshold: int
+    priority_adaptive_weights: bool
+    enable_virtual_reservations: bool
+    default_osl_blocks: int
+    virtual_reservation_ttl_ms: int
     decode_fallback: bool
 
     migration_limit: int
@@ -435,6 +447,144 @@ class FrontendArgGroup(ArgGroup):
             help=(
                 "KV Router: Maximum number of KV blocks to transfer in a single request. "
                 "Limits RDMA transfer size to avoid saturating the network."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--memory-pressure-weight",
+            env_var="DYN_MEMORY_PRESSURE_WEIGHT",
+            default=1.0,
+            help=(
+                "KV Router: Weight for memory pressure in transfer cost function. "
+                "Higher values penalize routing to memory-constrained workers more heavily. "
+                "Only active when --enable-kv-transfer is set and workers report capacity data."
+            ),
+            arg_type=float,
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--use-effective-load",
+            env_var="DYN_USE_EFFECTIVE_LOAD",
+            default=False,
+            dest="use_effective_load",
+            help=(
+                "KV Router: Enable OSL-weighted effective load in cost function. "
+                "Replaces raw decode_blocks with a predictive load estimate based on "
+                "per-request remaining output tokens. Requires workers to report capacity data."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--high-priority-contention-weight",
+            env_var="DYN_HIGH_PRIORITY_CONTENTION_WEIGHT",
+            default=1.3,
+            help=(
+                "KV Router: Contention multiplier for in-flight requests with higher priority "
+                "(lower number) than the new request. Default: 1.3."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--low-priority-contention-weight",
+            env_var="DYN_LOW_PRIORITY_CONTENTION_WEIGHT",
+            default=0.7,
+            help=(
+                "KV Router: Contention multiplier for in-flight requests with lower priority "
+                "(higher number) than the new request. Default: 0.7."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--headroom-weight",
+            env_var="DYN_HEADROOM_WEIGHT",
+            default=0.0,
+            help=(
+                "KV Router: Weight for future headroom bonus in cost function (0.0=disabled). "
+                "Higher values prefer workers where in-flight requests are about to finish."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--default-decode-tps",
+            env_var="DYN_DEFAULT_DECODE_TPS",
+            default=30.0,
+            help=(
+                "KV Router: Default per-request decode throughput estimate in tokens/sec. "
+                "Used when no observations are available for a worker. Default: 30.0."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--throughput-ema-alpha",
+            env_var="DYN_THROUGHPUT_EMA_ALPHA",
+            default=0.1,
+            help=(
+                "KV Router: EMA smoothing factor for throughput estimator (0.01-1.0). "
+                "Higher = more responsive to recent observations. Default: 0.1."
+            ),
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--high-priority-threshold",
+            env_var="DYN_HIGH_PRIORITY_THRESHOLD",
+            default=5,
+            help=(
+                "KV Router: Priority values at or below this are 'high priority'. "
+                "Only active when --priority-adaptive-weights is enabled. Default: 5."
+            ),
+            arg_type=int,
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--priority-adaptive-weights",
+            env_var="DYN_PRIORITY_ADAPTIVE_WEIGHTS",
+            default=False,
+            dest="priority_adaptive_weights",
+            help=(
+                "KV Router: Enable priority-adaptive weight adjustment. High-priority "
+                "requests trade cache-hit probability for faster scheduling."
+            ),
+        )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--enable-virtual-reservations",
+            env_var="DYN_ENABLE_VIRTUAL_RESERVATIONS",
+            default=False,
+            dest="enable_virtual_reservations",
+            help=(
+                "KV Router: Enable virtual capacity reservations. After routing a request, "
+                "immediately deducts predicted resource usage from the local capacity model "
+                "so the next request sees reduced free blocks. Real ActiveLoad updates from "
+                "workers overwrite virtual adjustments."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--default-osl-blocks",
+            env_var="DYN_DEFAULT_OSL_BLOCKS",
+            default=16,
+            help=(
+                "KV Router: Default predicted output length in blocks when expected_output_tokens "
+                "is not provided. Used for virtual reservations. Default: 16 (= 256 tokens at "
+                "block_size=16)."
+            ),
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--virtual-reservation-ttl-ms",
+            env_var="DYN_VIRTUAL_RESERVATION_TTL_MS",
+            default=500,
+            help=(
+                "KV Router: TTL for virtual reservations in milliseconds. If no real ActiveLoad "
+                "arrives within this duration, stale virtual reservation counts are reset. "
+                "Default: 500."
             ),
             arg_type=int,
         )

@@ -52,7 +52,7 @@ impl KvRouterConfig {
 #[pymethods]
 impl KvRouterConfig {
     #[new]
-    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, durable_kv_events=false, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, router_queue_threshold=None, router_event_threads=4, router_enable_cache_control=false, enable_kv_transfer=false, transfer_cost_weight=0.1, min_transfer_queue_advantage=8, max_transfer_blocks=256))]
+    #[pyo3(signature = (overlap_score_weight=1.0, router_temperature=0.0, use_kv_events=true, durable_kv_events=false, router_replica_sync=false, router_track_active_blocks=true, router_track_output_blocks=false, router_assume_kv_reuse=true, router_snapshot_threshold=1000000, router_reset_states=false, router_ttl_secs=120.0, router_max_tree_size=1048576, router_prune_target_ratio=0.8, router_queue_threshold=None, router_event_threads=4, router_enable_cache_control=false, enable_kv_transfer=false, transfer_cost_weight=0.1, min_transfer_queue_advantage=8, max_transfer_blocks=256, memory_pressure_weight=1.0, use_effective_load=false, high_priority_contention_weight=1.3, low_priority_contention_weight=0.7, headroom_weight=0.0, default_decode_tps=30.0, throughput_ema_alpha=0.1, high_priority_threshold=5, priority_adaptive_weights=false, enable_virtual_reservations=false, default_osl_blocks=16, virtual_reservation_ttl_ms=500))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         overlap_score_weight: f64,
@@ -75,6 +75,18 @@ impl KvRouterConfig {
         transfer_cost_weight: f64,
         min_transfer_queue_advantage: u64,
         max_transfer_blocks: u32,
+        memory_pressure_weight: f64,
+        use_effective_load: bool,
+        high_priority_contention_weight: f64,
+        low_priority_contention_weight: f64,
+        headroom_weight: f64,
+        default_decode_tps: f64,
+        throughput_ema_alpha: f64,
+        high_priority_threshold: i32,
+        priority_adaptive_weights: bool,
+        enable_virtual_reservations: bool,
+        default_osl_blocks: u32,
+        virtual_reservation_ttl_ms: u64,
     ) -> Self {
         KvRouterConfig {
             inner: RsKvRouterConfig {
@@ -98,6 +110,18 @@ impl KvRouterConfig {
                 transfer_cost_weight,
                 min_transfer_queue_advantage,
                 max_transfer_blocks,
+                memory_pressure_weight,
+                use_effective_load,
+                high_priority_contention_weight,
+                low_priority_contention_weight,
+                headroom_weight,
+                default_decode_tps,
+                throughput_ema_alpha,
+                high_priority_threshold,
+                priority_adaptive_weights,
+                enable_virtual_reservations,
+                default_osl_blocks,
+                virtual_reservation_ttl_ms,
             },
         }
     }

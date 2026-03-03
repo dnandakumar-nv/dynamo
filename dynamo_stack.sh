@@ -16,13 +16,15 @@ PAGE_SIZE=16
 HICACHE_RATIO=1.0
 HICACHE_POLICY=write_through
 CONTEXT_LENGTH=262144
-MEM_FRACTION=0.7
+MEM_FRACTION=0.9
 
 # KV Transfer tuning                              # <<< NEW
 TRANSFER_COST_WEIGHT=0.1                           # <<< NEW
-MIN_TRANSFER_QUEUE_ADVANTAGE=6                    # <<< NEW
+MIN_TRANSFER_QUEUE_ADVANTAGE=8                    # <<< NEW
 MAX_TRANSFER_BLOCKS=256                            # <<< NEW
-TRANSFER_TIMEOUT_MS=5000                           # <<< NEW
+TRANSFER_TIMEOUT_MS=15000                          # <<< NEW
+MAX_PENDING_KV_TRANSFERS=4                         # <<< NEW
+MAX_NIXL_STARTS_PER_POLL=2                         # <<< NEW
 
 LOG_DIR="/tmp/dynamo-stack"
 
@@ -62,6 +64,9 @@ python3 -m dynamo.frontend \
     --transfer-cost-weight $TRANSFER_COST_WEIGHT \
     --min-transfer-queue-advantage $MIN_TRANSFER_QUEUE_ADVANTAGE \
     --max-transfer-blocks $MAX_TRANSFER_BLOCKS \
+    --use-effective-load \
+    --headroom-weight 1.0 \
+    --enable-virtual-reservations \
     2>&1 | tee -a "$LOGFILE" &
 PIDS+=($!)
 
@@ -91,6 +96,8 @@ for WORKER in 0 1 2 3; do
         --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:'"$ZMQ_PORT"'"}' \
         --enable-kv-transfer \
         --transfer-timeout-ms $TRANSFER_TIMEOUT_MS \
+        --max-pending-kv-transfers $MAX_PENDING_KV_TRANSFERS \
+        --max-nixl-starts-per-poll $MAX_NIXL_STARTS_PER_POLL \
         2>&1 | tee -a "$LOGFILE" &
     PIDS+=($!)
 done

@@ -61,11 +61,15 @@ class KvTransferManager:
         config: Config,
         metadata_cache_ttl_s: int = 300,
         transfer_timeout_ms: int = 5000,
+        max_pending_kv_transfers: int = 4,
+        max_nixl_starts_per_poll: int = 2,
     ):
         self.engine = engine
         self.config = config
         self.page_size = config.server_args.page_size
         self.transfer_timeout_ms = transfer_timeout_ms
+        self.max_pending_kv_transfers = max_pending_kv_transfers
+        self.max_nixl_starts_per_poll = max_nixl_starts_per_poll
         self.target_handler = None  # Set by init_decode
         # Bytes per KV block, computed after init_kv_transfer.
         # Used for byte-level transfer metrics.
@@ -107,6 +111,8 @@ class KvTransferManager:
                     "init_kv_transfer",
                     per_rank=True,
                     page_size=self.page_size,
+                    max_pending_kv_transfers=self.max_pending_kv_transfers,
+                    max_nixl_starts_per_poll=self.max_nixl_starts_per_poll,
                 )
 
                 # Create per-rank PUSH sockets connected to each rank's

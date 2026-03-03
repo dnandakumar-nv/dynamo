@@ -214,6 +214,15 @@ pub mod frontend_service {
     /// Gauge metric tracking current queued prefill tokens for each worker
     pub const WORKER_ACTIVE_PREFILL_TOKENS: &str = "worker_active_prefill_tokens";
 
+    /// Free KV cache blocks per worker (from ActiveLoad capacity reports)
+    pub const WORKER_FREE_KV_BLOCKS: &str = "worker_free_kv_blocks";
+
+    /// Evictable KV cache blocks per worker
+    pub const WORKER_EVICTABLE_KV_BLOCKS: &str = "worker_evictable_kv_blocks";
+
+    /// Number of running requests per worker
+    pub const WORKER_RUNNING_REQUESTS: &str = "worker_running_requests";
+
     /// Last observed time to first token per worker (in seconds)
     /// Gauge metric tracking the most recent TTFT for each worker
     pub const WORKER_LAST_TIME_TO_FIRST_TOKEN_SECONDS: &str =
@@ -488,6 +497,14 @@ pub mod kvrouter {
     pub const COST_WITHOUT_TRANSFER: &str = "cost_without_transfer";
     pub const TRANSFER_ADVANTAGE: &str = "transfer_advantage";
     pub const NO_TRANSFER_REASONS_TOTAL: &str = "no_transfer_reasons_total";
+
+    // Oracle routing observability metrics (Phase 7)
+    pub const EFFECTIVE_LOAD: &str = "effective_load";
+    pub const MEMORY_PRESSURE: &str = "memory_pressure";
+    pub const HEADROOM_RATIO: &str = "headroom_ratio";
+    pub const VIRTUAL_RESERVATION_BLOCKS_TOTAL: &str = "virtual_reservation_blocks_total";
+    pub const VIRTUAL_RESERVATION_COUNT: &str = "virtual_reservation_count";
+    pub const ROUTING_DECISION_LOGIT: &str = "routing_decision_logit";
 }
 
 /// Block access metrics emitted by the KV indexer when processing BlockAccessed events.

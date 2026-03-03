@@ -55,6 +55,12 @@ pub struct ActiveSequences {
     #[getter(copy)]
     active_tokens: usize,
 
+    /// When each request's prefill completed (decode started), for throughput estimation.
+    decode_start_times: HashMap<RequestId, Instant>,
+
+    /// Number of output blocks added per request (for throughput estimation).
+    output_block_counts: HashMap<RequestId, u32>,
+
     /// Timer for when to force expiry of stale requests
     expiry_timer: Instant,
 
@@ -76,6 +82,8 @@ impl ActiveSequences {
             fractional_blocks: HashMap::new(),
             block_size,
             active_tokens: 0,
+            decode_start_times: HashMap::new(),
+            output_block_counts: HashMap::new(),
             expiry_timer: Instant::now() + EXPIRY_DURATION,
             expiry_requests: HashSet::new(),
         }
@@ -176,13 +184,16 @@ impl ActiveSequences {
         removed_requests
     }
 
-    /// Mark prefill as completed for a request, removing it from prefill_tokens tracking
+    /// Mark prefill as completed for a request, removing it from prefill_tokens tracking.
+    /// Records the decode start time for throughput estimation.
     pub fn mark_prefill_completed(&mut self, request_id: &RequestId) {
         if let Some(tokens) = self.prefill_tokens.remove(request_id) {
             self.active_tokens = self
                 .active_tokens
                 .checked_sub(tokens)
                 .expect("active_tokens underflow");
+            self.decode_start_times
+                .insert(request_id.clone(), Instant::now());
         }
     }
 
@@ -227,10 +238,22 @@ impl ActiveSequences {
         self.new_blocks(token_sequence) + self.active_blocks()
     }
 
+    /// Get the decode start time for a request (for throughput estimation).
+    pub fn decode_start_time(&self, request_id: &RequestId) -> Option<Instant> {
+        self.decode_start_times.get(request_id).copied()
+    }
+
+    /// Get the number of output blocks generated for a request (for throughput estimation).
+    pub fn output_block_count(&self, request_id: &RequestId) -> u32 {
+        self.output_block_counts.get(request_id).copied().unwrap_or(0)
+    }
+
     /// Free all blocks associated with a request
     pub fn free(&mut self, request_id: &RequestId) -> usize {
         self.mark_prefill_completed(request_id);
 
+        self.decode_start_times.remove(request_id);
+        self.output_block_counts.remove(request_id);
         self.expiry_requests.remove(request_id);
 
         // Remove expected output tokens tracking
@@ -285,6 +308,9 @@ impl ActiveSequences {
             .get_mut(request_id)
             .unwrap()
             .push((random_hash, rc));
+
+        // Increment output block counter for throughput estimation
+        *self.output_block_counts.entry(request_id.clone()).or_insert(0) += 1;
 
         // Apply fractional decay to all single-ref blocks in this request if provided
         if let Some(frac) = decay_fraction {

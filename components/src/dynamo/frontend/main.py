@@ -198,6 +198,18 @@ async def async_main():
             transfer_cost_weight=config.transfer_cost_weight,
             min_transfer_queue_advantage=config.min_transfer_queue_advantage,
             max_transfer_blocks=config.max_transfer_blocks,
+            memory_pressure_weight=config.memory_pressure_weight,
+            use_effective_load=config.use_effective_load,
+            high_priority_contention_weight=config.high_priority_contention_weight,
+            low_priority_contention_weight=config.low_priority_contention_weight,
+            headroom_weight=config.headroom_weight,
+            default_decode_tps=config.default_decode_tps,
+            throughput_ema_alpha=config.throughput_ema_alpha,
+            high_priority_threshold=config.high_priority_threshold,
+            priority_adaptive_weights=config.priority_adaptive_weights,
+            enable_virtual_reservations=config.enable_virtual_reservations,
+            default_osl_blocks=config.default_osl_blocks,
+            virtual_reservation_ttl_ms=config.virtual_reservation_ttl_ms,
         )
     elif config.router_mode == "random":
         router_mode = RouterMode.Random
