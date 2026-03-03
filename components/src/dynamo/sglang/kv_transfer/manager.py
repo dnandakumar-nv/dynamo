@@ -67,6 +67,9 @@ class KvTransferManager:
         self.page_size = config.server_args.page_size
         self.transfer_timeout_ms = transfer_timeout_ms
         self.target_handler = None  # Set by init_decode
+        # Bytes per KV block, computed after init_kv_transfer.
+        # Used for byte-level transfer metrics.
+        self.bytes_per_block = 0
 
         # Lock to serialize collective_rpc calls. SGLang's Engine uses ZMQ
         # sockets internally which are NOT thread-safe. Without this lock,
@@ -113,19 +116,26 @@ class KvTransferManager:
 
                 ctx = zmq.Context(1)
                 self._kv_transfer_sockets = []
+                bytes_per_block = 0
                 for rank_result in results:
                     if rank_result.get("status") != "ok":
                         raise RuntimeError(
                             f"init_kv_transfer failed on rank: {rank_result}"
                         )
                     ipc_path = rank_result["ipc_path"]
+                    if not bytes_per_block:
+                        bytes_per_block = rank_result.get(
+                            "bytes_per_block", 0
+                        )
                     sock = ctx.socket(zmq.PUSH)
                     sock.setsockopt(zmq.SNDHWM, 64)
                     sock.connect(f"ipc://{ipc_path}")
                     self._kv_transfer_sockets.append(sock)
                 self._kv_zmq_ctx = ctx
+                return bytes_per_block
 
-            await asyncio.to_thread(_init)
+            bpb = await asyncio.to_thread(_init)
+            self.bytes_per_block = bpb
             logging.info(
                 f"KV Transfer: initialized with "
                 f"{len(self._kv_transfer_sockets)} rank sockets"

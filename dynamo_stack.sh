@@ -20,7 +20,7 @@ MEM_FRACTION=0.7
 
 # KV Transfer tuning                              # <<< NEW
 TRANSFER_COST_WEIGHT=0.1                           # <<< NEW
-MIN_TRANSFER_QUEUE_ADVANTAGE=4                     # <<< NEW
+MIN_TRANSFER_QUEUE_ADVANTAGE=6                    # <<< NEW
 MAX_TRANSFER_BLOCKS=256                            # <<< NEW
 TRANSFER_TIMEOUT_MS=5000                           # <<< NEW
 

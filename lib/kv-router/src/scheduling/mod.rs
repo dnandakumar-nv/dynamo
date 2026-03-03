@@ -4,6 +4,7 @@
 pub mod config;
 pub mod queue;
 pub mod selector;
+pub mod transfer_metrics;
 
 mod types;
 pub use types::*;

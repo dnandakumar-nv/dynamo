@@ -28,19 +28,35 @@ Usage (both patterns supported):
 from __future__ import annotations
 
 
+class block_access:
+    """Block access metrics emitted by the KV indexer when processing BlockAccessed events."""
+
+    # Total blocks served from cache across all requests (counter).
+    BLOCKS_CACHED_TOTAL = "blocks_cached_total"
+    # Total blocks freshly prefilled across all requests (counter).
+    BLOCKS_PREFILLED_TOTAL = "blocks_prefilled_total"
+    # Per-request cache efficiency ratio (histogram, 0.0-1.0).
+    REQUEST_CACHE_EFFICIENCY = "request_cache_efficiency"
+    # Total BlockAccessed events processed (counter).
+    ACCESS_EVENTS_TOTAL = "access_events_total"
+    # Total miss blocks caused by routing to wrong worker (counter).
+    MISSES_ROUTING_TOTAL = "misses_routing_total"
+    # Total miss blocks caused by eviction from cache (counter).
+    MISSES_EVICTION_TOTAL = "misses_eviction_total"
+    # Total miss blocks that were never seen / cold (counter).
+    MISSES_COLD_TOTAL = "misses_cold_total"
+
 class component_names:
     """Well-known component names used as values for the `dynamo_component` label."""
 
     # Component name for the KV router (frontend-side request routing).
     ROUTER = "router"
 
-
 class distributed_runtime:
     """DistributedRuntime core metrics"""
 
     # Total uptime of the DistributedRuntime in seconds
     UPTIME_SECONDS = "uptime_seconds"
-
 
 class frontend_service:
     """Frontend service metrics (LLM HTTP service)"""
@@ -112,7 +128,6 @@ class frontend_service:
     # Label name for tokenizer operation
     OPERATION_LABEL = "operation"
 
-
 class kvbm:
     """KVBM"""
 
@@ -147,37 +162,24 @@ class kvbm:
     # Number of failed object storage write operations (blocks)
     OBJECT_WRITE_FAILURES = "object_write_failures"
 
-
-class block_access:
-    """Block access metrics emitted by the KV indexer when processing BlockAccessed events."""
-
-    # Total blocks served from cache across all requests (counter).
-    BLOCKS_CACHED_TOTAL = "blocks_cached_total"
-    # Total blocks freshly prefilled across all requests (counter).
-    BLOCKS_PREFILLED_TOTAL = "blocks_prefilled_total"
-    # Per-request cache efficiency ratio (histogram, 0.0-1.0).
-    REQUEST_CACHE_EFFICIENCY = "request_cache_efficiency"
-    # Total BlockAccessed events processed (counter).
-    ACCESS_EVENTS_TOTAL = "access_events_total"
-    # Total miss blocks caused by routing to wrong worker (counter).
-    MISSES_ROUTING_TOTAL = "misses_routing_total"
-    # Total miss blocks caused by eviction from cache (counter).
-    MISSES_EVICTION_TOTAL = "misses_eviction_total"
-    # Total miss blocks that were never seen / cold (counter).
-    MISSES_COLD_TOTAL = "misses_cold_total"
-
-
 class kvrouter:
+
     # Number of KV cache events applied to the index (including status)
     KV_CACHE_EVENTS_APPLIED = "kv_cache_events_applied"
-
+    TRANSFER_DECISIONS_TOTAL = "transfer_decisions_total"
+    TRANSFER_BLOCKS_ROUTED_TOTAL = "transfer_blocks_routed_total"
+    TRANSFER_ESTIMATED_MS = "transfer_estimated_ms"
+    COST_WITH_TRANSFER = "cost_with_transfer"
+    COST_WITHOUT_TRANSFER = "cost_without_transfer"
+    TRANSFER_ADVANTAGE = "transfer_advantage"
+    NO_TRANSFER_REASONS_TOTAL = "no_transfer_reasons_total"
 
 class kvstats:
+
     # Total number of KV cache blocks available on the worker
     TOTAL_BLOCKS = "total_blocks"
     # GPU cache usage as a percentage (0.0-1.0)
     GPU_CACHE_USAGE_PERCENT = "gpu_cache_usage_percent"
-
 
 class labels:
     """Automatically inserted Prometheus label names used across the metrics system"""
@@ -208,11 +210,10 @@ class labels:
     # Label for router instance (discovery.instance_id() of the frontend)
     ROUTER_ID = "router_id"
 
-
 class model_info:
+
     # Model load time in seconds
     LOAD_TIME_SECONDS = "model_load_time_seconds"
-
 
 class name_prefix:
     """Metric name prefixes used across the metrics system"""
@@ -224,26 +225,8 @@ class name_prefix:
     # Prefix for KV router metrics (used with router_id label)
     ROUTER = "dynamo_router"
 
-
-class router_request:
-    """Router per-request metrics (component-scoped via `MetricsHierarchy`)."""
-
-    # Prefix prepended to `frontend_service::*` names to form router metric names.
-    # e.g. `"router_"` + `frontend_service::REQUESTS_TOTAL` → `"router_requests_total"`.
-    METRIC_PREFIX = "router_"
-
-
 class router:
-    """Router request metrics (dynamo_component_router_* with dynamo_namespace label).
-
-    These constants are the full suffix portions combined with name_prefix.COMPONENT
-    ("dynamo_component") to form the complete metric name, e.g.
-    dynamo_component_router_requests_total.
-
-    Registered via MetricsHierarchy (from_component()) which auto-injects
-    dynamo_namespace (underscores) and dynamo_component labels and registers
-    with the component's registry (port 9090).
-    """
+    """Router request metrics (component-scoped aggregate histograms + counter)"""
 
     # Total number of requests processed by the router
     REQUESTS_TOTAL = "router_requests_total"
@@ -255,12 +238,13 @@ class router:
     INPUT_SEQUENCE_TOKENS = "router_input_sequence_tokens"
     # Output sequence length in tokens observed at the router
     OUTPUT_SEQUENCE_TOKENS = "router_output_sequence_tokens"
-    # TODO: Add REQUEST_DURATION_SECONDS = "router_request_duration_seconds" once
-    #       RouterRequestMetrics in lib/llm/src/kv_router/metrics.rs registers a
-    #       dynamo_component_router_request_duration_seconds histogram. Until then,
-    #       get_avg_request_duration (router path) falls back to the work_handler
-    #       constant and queries a non-existent metric, silently returning 0.
 
+class router_request:
+    """Router per-request metrics (component-scoped via `MetricsHierarchy`)."""
+
+    # Prefix prepended to `frontend_service::*` names to form router metric names.
+    # e.g. `"router_"` + `frontend_service::REQUESTS_TOTAL` → `"router_requests_total"`.
+    METRIC_PREFIX = "router_"
 
 class routing_overhead:
     """Routing overhead phase latency histogram suffixes."""
@@ -275,7 +259,6 @@ class routing_overhead:
     SCHEDULING_MS = "overhead_scheduling_ms"
     # Total routing overhead per request
     TOTAL_MS = "overhead_total_ms"
-
 
 class task_tracker:
     """Task tracker Prometheus metric name suffixes"""
@@ -292,7 +275,6 @@ class task_tracker:
     TASKS_FAILED_TOTAL = "tasks_failed_total"
     # Total number of rejected tasks
     TASKS_REJECTED_TOTAL = "tasks_rejected_total"
-
 
 class work_handler:
     """Work handler Prometheus metric names"""

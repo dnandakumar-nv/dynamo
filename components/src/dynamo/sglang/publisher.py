@@ -301,12 +301,12 @@ def setup_prometheus_registry(
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
 
-    # Register callback for SGLang metrics (sglang:* prefixed)
+    # Register callback for SGLang and KV transfer metrics
     # Auto-label injection: hierarchy labels are added automatically
     register_engine_metrics_callback(
         endpoint=generate_endpoint,
         registry=registry,
-        metric_prefix_filters=["sglang:"],
+        metric_prefix_filters=["sglang:", "dynamo_kv_transfer_"],
         namespace_name=config.dynamo_args.namespace,
         component_name=config.dynamo_args.component,
         endpoint_name=config.dynamo_args.endpoint,

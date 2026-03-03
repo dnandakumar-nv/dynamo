@@ -191,33 +191,36 @@ impl KvEventPublisher {
         let warning_count = self.warning_count.clone();
         let inner = self.inner.clone();
 
-        let event_id = inner.next_event_id();
-
         let mm_infos = block_mm_infos
             .as_ref()
             .map(depythonize_block_mm_infos)
             .transpose()?;
 
+        // Use publish_next to atomically assign event_id and send, preventing
+        // races with the ZMQ listener thread that would cause out-of-order IDs.
         py.allow_threads(|| {
             let block_hashes_u64: Vec<u64> = block_hashes.iter().map(|&h| h as u64).collect();
-            let event = KvCacheEvent {
-                event_id,
-                data: KvCacheEventData::Stored(KvCacheStoreData {
-                    parent_hash: parent_hash.map(ExternalSequenceBlockHash::from),
-                    blocks: create_stored_blocks(
-                        kv_block_size,
-                        &token_ids,
-                        &num_block_tokens,
-                        &block_hashes_u64,
-                        lora_name.as_deref(),
-                        &warning_count,
-                        mm_infos.as_deref(),
-                    ),
-                }),
-                dp_rank,
-            };
+            let parent = parent_hash.map(ExternalSequenceBlockHash::from);
+            let blocks = create_stored_blocks(
+                kv_block_size,
+                &token_ids,
+                &num_block_tokens,
+                &block_hashes_u64,
+                lora_name.as_deref(),
+                &warning_count,
+                mm_infos.as_deref(),
+            );
 
-            inner.publish(event).map_err(to_pyerr)
+            inner
+                .publish_next(|event_id| KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: parent,
+                        blocks,
+                    }),
+                    dp_rank,
+                })
+                .map_err(to_pyerr)
         })
     }
 
@@ -225,21 +228,21 @@ impl KvEventPublisher {
         let dp_rank = self.dp_rank;
         let inner = self.inner.clone();
 
-        // Use shared monotonic event_id counter from the inner publisher
-        let event_id = inner.next_event_id();
-
+        // Use publish_next to atomically assign event_id and send, preventing
+        // races with the ZMQ listener thread that would cause out-of-order IDs.
         py.allow_threads(|| {
             let block_hashes: Vec<ExternalSequenceBlockHash> = block_hashes
                 .into_iter()
                 .map(ExternalSequenceBlockHash::from)
                 .collect();
-            let event = KvCacheEvent {
-                event_id,
-                data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
-                dp_rank,
-            };
 
-            inner.publish(event).map_err(to_pyerr)
+            inner
+                .publish_next(|event_id| KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
+                    dp_rank,
+                })
+                .map_err(to_pyerr)
         })
     }
 

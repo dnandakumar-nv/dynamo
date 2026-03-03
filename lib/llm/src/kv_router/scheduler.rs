@@ -45,7 +45,10 @@ impl KvScheduler {
         let selector = selector.unwrap_or_else(|| {
             if kv_router_config.enable_kv_transfer {
                 tracing::info!("Using TransferAwareWorkerSelector (enable_kv_transfer=true)");
-                Box::new(TransferAwareWorkerSelector::new(Some(*kv_router_config)))
+                Box::new(TransferAwareWorkerSelector::with_component(
+                    Some(*kv_router_config),
+                    &component,
+                ))
             } else {
                 Box::new(DefaultWorkerSelector::new(Some(*kv_router_config)))
             }

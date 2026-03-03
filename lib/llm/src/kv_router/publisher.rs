@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -79,6 +79,7 @@ impl KvEventSource {
         cancellation_token: CancellationToken,
         tx: mpsc::UnboundedSender<KvCacheEvent>,
         next_event_id: Arc<AtomicU64>,
+        publish_lock: Arc<Mutex<()>>,
     ) -> Result<Self> {
         match source_config {
             KvEventSourceConfig::Zmq { endpoint, topic } => {
@@ -93,6 +94,7 @@ impl KvEventSource {
                         cancellation_token.clone(),
                         kv_block_size,
                         next_event_id,
+                        publish_lock,
                     ));
 
                 Ok(KvEventSource::Zmq { zmq_handle })
@@ -123,6 +125,11 @@ pub struct KvEventPublisher {
     /// Internal monotonic event ID counter - ensures each event gets a unique, incrementing ID.
     /// Shared with the ZMQ listener (if any) to maintain consistency.
     next_event_id: Arc<AtomicU64>,
+    /// Serializes (event_id assignment + channel send) so events always enter
+    /// the channel in event_id order.  Without this, the ZMQ listener thread
+    /// and Python `publish_stored` calls can race, producing out-of-order IDs
+    /// that break the downstream `LocalKvIndexer` buffer.
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl KvEventPublisher {
@@ -161,6 +168,8 @@ impl KvEventPublisher {
 
         // Internal monotonic event ID counter - shared with ZMQ listener if any
         let next_event_id = Arc::new(AtomicU64::new(0));
+        // Lock that serializes (event_id assignment + channel send)
+        let publish_lock = Arc::new(Mutex::new(()));
 
         // Create our event source (if any)
         let mut source = None;
@@ -172,6 +181,7 @@ impl KvEventPublisher {
                 cancellation_token.clone(),
                 tx.clone(),
                 next_event_id.clone(),
+                publish_lock.clone(),
             )?);
         }
 
@@ -274,17 +284,36 @@ impl KvEventPublisher {
             cancellation_token,
             tx,
             next_event_id,
+            publish_lock,
         })
     }
 
     pub fn publish(&self, event: KvCacheEvent) -> Result<(), mpsc::error::SendError<KvCacheEvent>> {
+        let _guard = self.publish_lock.lock().unwrap();
         self.tx.send(event)
     }
 
     /// Get and increment the next event ID atomically.
     /// Use this to assign monotonically increasing event IDs to events before publishing.
+    ///
+    /// **WARNING**: Using `next_event_id()` followed by a separate `publish()` is racy
+    /// when multiple threads produce events. Prefer [`publish_next`] instead.
     pub fn next_event_id(&self) -> u64 {
         self.next_event_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Atomically assign the next event ID, build the event, and publish it.
+    ///
+    /// This holds a lock across the (ID assignment + channel send) pair so that
+    /// events always enter the channel in monotonic event_id order, even when
+    /// the ZMQ listener thread and Python callers race.
+    pub fn publish_next(
+        &self,
+        make_event: impl FnOnce(u64) -> KvCacheEvent,
+    ) -> Result<(), mpsc::error::SendError<KvCacheEvent>> {
+        let _guard = self.publish_lock.lock().unwrap();
+        let event_id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
+        self.tx.send(make_event(event_id))
     }
 
     pub fn kv_block_size(&self) -> u32 {
@@ -450,6 +479,7 @@ pub async fn start_zmq_listener(
     cancellation_token: CancellationToken,
     kv_block_size: u32,
     next_event_id: Arc<AtomicU64>,
+    publish_lock: Arc<Mutex<()>>,
 ) {
     tracing::debug!(
         "KVEventPublisher connecting to ZMQ endpoint {} (topic '{}')",
@@ -562,7 +592,10 @@ pub async fn start_zmq_listener(
 
                 let dp_rank = batch.data_parallel_rank.unwrap_or(0) as u32;
                 for raw_event in batch.events.into_iter() {
-                    // Use shared monotonic event_id counter instead of engine's sequence number
+                    // Hold publish_lock across (event_id assignment + channel send) so
+                    // events always enter the channel in monotonic order, even when a
+                    // concurrent Python `publish_stored` call is in flight.
+                    let _guard = publish_lock.lock().unwrap();
                     let event_id = next_event_id.fetch_add(1, Ordering::SeqCst);
 
                     let event = convert_event(raw_event, event_id, kv_block_size, dp_rank, &warning_count);

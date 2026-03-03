@@ -22,6 +22,7 @@ Tests cover:
 import asyncio
 import inspect
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -2477,3 +2478,352 @@ class TestAggregatedVsDisaggregated:
             async for _ in DecodeWorkerHandler.generate(handler, request, ctx):
                 pass
         mgr.target_handler.execute_transfer.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: New Metrics (bytes, NIXL ops/bytes/duration)
+# ---------------------------------------------------------------------------
+
+class TestNewMetrics:
+    """Tests for Phase 6 new metrics: bytes, NIXL ops/bytes/duration."""
+
+    def _reset_metrics(self):
+        from dynamo.sglang.kv_transfer import metrics
+
+        metrics._metrics_initialized = False
+        metrics._transfer_requests = None
+        metrics._transfer_blocks = None
+        metrics._transfer_duration = None
+        metrics._transfer_fallback = None
+        metrics._transfer_events_published = None
+        metrics._transfer_bytes = None
+        metrics._nixl_read_ops = None
+        metrics._nixl_read_bytes = None
+        metrics._nixl_read_duration = None
+        return metrics
+
+    def test_record_transfer_bytes_without_prometheus(self):
+        """record_transfer_bytes() is safe without prometheus."""
+        metrics = self._reset_metrics()
+        # Should not raise even if Prometheus is not available
+        metrics.record_transfer_bytes("target", 1024)
+
+    def test_record_transfer_bytes_with_prometheus(self):
+        """record_transfer_bytes() records correctly with prometheus."""
+        metrics = self._reset_metrics()
+        metrics._ensure_initialized()
+        if metrics._metrics_initialized:
+            assert metrics._transfer_bytes is not None
+            metrics.record_transfer_bytes("target", 4096)
+            metrics.record_transfer_bytes("source", 2048)
+
+    def test_record_nixl_read_op_without_prometheus(self):
+        """record_nixl_read_op() is safe without prometheus."""
+        metrics = self._reset_metrics()
+        metrics.record_nixl_read_op(1024, 0.005)  # Should not raise
+
+    def test_record_nixl_read_op_with_prometheus(self):
+        """record_nixl_read_op() records all three NIXL metrics."""
+        metrics = self._reset_metrics()
+        metrics._ensure_initialized()
+        if metrics._metrics_initialized:
+            assert metrics._nixl_read_ops is not None
+            assert metrics._nixl_read_bytes is not None
+            assert metrics._nixl_read_duration is not None
+            metrics.record_nixl_read_op(8192, 0.002)
+
+    def test_new_metrics_initialized_with_existing(self):
+        """New metrics are initialized alongside existing ones."""
+        metrics = self._reset_metrics()
+        metrics._ensure_initialized()
+        if metrics._metrics_initialized:
+            # All existing metrics still initialized
+            assert metrics._transfer_requests is not None
+            assert metrics._transfer_blocks is not None
+            assert metrics._transfer_duration is not None
+            assert metrics._transfer_fallback is not None
+            assert metrics._transfer_events_published is not None
+            # New metrics also initialized
+            assert metrics._transfer_bytes is not None
+            assert metrics._nixl_read_ops is not None
+            assert metrics._nixl_read_bytes is not None
+            assert metrics._nixl_read_duration is not None
+
+    def test_record_transfer_bytes_labels(self):
+        """Verify transfer_bytes accepts role labels correctly."""
+        metrics = self._reset_metrics()
+        metrics._ensure_initialized()
+        for role in ["source", "target"]:
+            metrics.record_transfer_bytes(role, 512)
+
+    def test_record_nixl_read_op_multiple_calls(self):
+        """Multiple NIXL read ops should accumulate without error."""
+        metrics = self._reset_metrics()
+        metrics._ensure_initialized()
+        if metrics._metrics_initialized:
+            for i in range(10):
+                metrics.record_nixl_read_op(4096, 0.001 * (i + 1))
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Target Handler Bytes Metrics
+# ---------------------------------------------------------------------------
+
+class TestTargetHandlerBytesMetrics:
+    """Tests that target handler records transfer_bytes metric."""
+
+    def setup_method(self):
+        from dynamo.sglang.kv_transfer.target_handler import (
+            KvTransferTargetHandler,
+        )
+        self.KvTransferTargetHandler = KvTransferTargetHandler
+
+    def _make_handler(self, bytes_per_block=4096):
+        manager = MagicMock()
+        manager.page_size = 16
+        manager.bytes_per_block = bytes_per_block
+        manager.config.dynamo_args.kv_transfer_min_blocks = 1
+        return self.KvTransferTargetHandler(manager)
+
+    @pytest.mark.asyncio
+    async def test_records_bytes_on_success(self):
+        """Verify record_transfer_bytes called with correct role and byte count."""
+        handler = self._make_handler(bytes_per_block=4096)
+
+        handler.manager.get_cached_metadata.return_value = {"status": "ok"}
+        handler._rpc_to_source = AsyncMock(return_value={
+            "status": "ok",
+            "kv_indices": list(range(5)),
+            "num_matched_blocks": 5,
+        })
+        handler.manager.execute_receive_transfer_async = AsyncMock(
+            return_value=True
+        )
+
+        with patch(
+            "dynamo.sglang.kv_transfer.metrics.record_transfer_bytes"
+        ) as mock_bytes:
+            result = await handler.execute_transfer(
+                {
+                    "source_worker": {"worker_id": 1, "dp_rank": 0},
+                    "num_blocks": 5,
+                },
+                list(range(80)),
+            )
+            assert result.success is True
+            mock_bytes.assert_called_once_with("target", 5 * 4096)
+
+    @pytest.mark.asyncio
+    async def test_no_bytes_on_failure(self):
+        """Verify record_transfer_bytes NOT called on failed transfer."""
+        handler = self._make_handler(bytes_per_block=4096)
+
+        with patch(
+            "dynamo.sglang.kv_transfer.metrics.record_transfer_bytes"
+        ) as mock_bytes:
+            result = await handler.execute_transfer(
+                {"num_blocks": 5}, [1, 2, 3]
+            )
+            assert result.success is False
+            mock_bytes.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_bytes_when_zero_bytes_per_block(self):
+        """Verify record_transfer_bytes NOT called when bytes_per_block=0."""
+        handler = self._make_handler(bytes_per_block=0)
+
+        handler.manager.get_cached_metadata.return_value = {"status": "ok"}
+        handler._rpc_to_source = AsyncMock(return_value={
+            "status": "ok",
+            "kv_indices": list(range(5)),
+            "num_matched_blocks": 5,
+        })
+        handler.manager.execute_receive_transfer_async = AsyncMock(
+            return_value=True
+        )
+
+        with patch(
+            "dynamo.sglang.kv_transfer.metrics.record_transfer_bytes"
+        ) as mock_bytes:
+            result = await handler.execute_transfer(
+                {
+                    "source_worker": {"worker_id": 1, "dp_rank": 0},
+                    "num_blocks": 5,
+                },
+                list(range(80)),
+            )
+            assert result.success is True
+            mock_bytes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Structured Logging
+# ---------------------------------------------------------------------------
+
+class TestStructuredLogging:
+    """Tests that structured logging includes correct extra fields."""
+
+    def setup_method(self):
+        from dynamo.sglang.kv_transfer.target_handler import (
+            KvTransferTargetHandler,
+        )
+        self.KvTransferTargetHandler = KvTransferTargetHandler
+
+    def _make_handler(self, bytes_per_block=4096):
+        manager = MagicMock()
+        manager.page_size = 16
+        manager.config.dynamo_args.kv_transfer_min_blocks = 1
+        manager.bytes_per_block = bytes_per_block
+        return self.KvTransferTargetHandler(manager)
+
+    @pytest.mark.asyncio
+    async def test_transfer_initiated_has_extra(self, caplog):
+        """'KV transfer initiated' log includes source_worker and num_hint_blocks."""
+        handler = self._make_handler()
+
+        handler.manager.get_cached_metadata.return_value = {"status": "ok"}
+        handler._rpc_to_source = AsyncMock(return_value={
+            "status": "ok",
+            "kv_indices": list(range(5)),
+            "num_matched_blocks": 5,
+        })
+        handler.manager.execute_receive_transfer_async = AsyncMock(
+            return_value=True
+        )
+
+        with caplog.at_level(logging.INFO):
+            await handler.execute_transfer(
+                {
+                    "source_worker": {"worker_id": 42, "dp_rank": 0},
+                    "num_blocks": 5,
+                },
+                list(range(80)),
+            )
+
+        initiated_records = [
+            r for r in caplog.records
+            if "KV transfer initiated" in r.getMessage()
+        ]
+        assert len(initiated_records) >= 1
+        rec = initiated_records[0]
+        assert getattr(rec, "event", None) == "kv_transfer_initiated"
+        assert getattr(rec, "source_worker", None) == 42
+        assert getattr(rec, "num_hint_blocks", None) == 5
+
+    @pytest.mark.asyncio
+    async def test_transfer_completed_has_extra(self, caplog):
+        """'KV transfer completed' log includes elapsed_ms and result."""
+        handler = self._make_handler()
+
+        handler.manager.get_cached_metadata.return_value = {"status": "ok"}
+        handler._rpc_to_source = AsyncMock(return_value={
+            "status": "ok",
+            "kv_indices": list(range(5)),
+            "num_matched_blocks": 5,
+        })
+        handler.manager.execute_receive_transfer_async = AsyncMock(
+            return_value=True
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = await handler.execute_transfer(
+                {
+                    "source_worker": {"worker_id": 1, "dp_rank": 0},
+                    "num_blocks": 5,
+                },
+                list(range(80)),
+            )
+
+        assert result.success is True
+        completed_records = [
+            r for r in caplog.records
+            if "KV transfer completed" in r.getMessage()
+        ]
+        assert len(completed_records) >= 1
+        rec = completed_records[0]
+        assert getattr(rec, "event", None) == "kv_transfer_completed"
+        assert getattr(rec, "result", None) == "success"
+        assert getattr(rec, "num_blocks", None) == 5
+        assert isinstance(getattr(rec, "elapsed_ms", None), float)
+
+    @pytest.mark.asyncio
+    async def test_transfer_failed_has_extra(self, caplog):
+        """Transfer failure log includes error and result."""
+        handler = self._make_handler()
+
+        handler.manager.get_cached_metadata.return_value = {"status": "ok"}
+        handler._rpc_to_source = AsyncMock(return_value={
+            "status": "ok",
+            "kv_indices": list(range(5)),
+            "num_matched_blocks": 5,
+        })
+        handler.manager.execute_receive_transfer_async = AsyncMock(
+            side_effect=RuntimeError("GPU OOM")
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await handler.execute_transfer(
+                {
+                    "source_worker": {"worker_id": 1, "dp_rank": 0},
+                    "num_blocks": 5,
+                },
+                list(range(80)),
+            )
+
+        assert result.success is False
+        failed_records = [
+            r for r in caplog.records
+            if "KV transfer failed" in r.getMessage()
+        ]
+        assert len(failed_records) >= 1
+        rec = failed_records[0]
+        assert getattr(rec, "event", None) == "kv_transfer_failed"
+        assert getattr(rec, "result", None) == "fallback_to_prefill"
+        assert "GPU OOM" in getattr(rec, "error", "")
+
+
+# ---------------------------------------------------------------------------
+# _classify_transfer_error
+# ---------------------------------------------------------------------------
+
+class TestClassifyTransferError:
+    """Tests for the error classification helper used in fallback metrics."""
+
+    def setup_method(self):
+        from dynamo.sglang.kv_transfer.target_handler import _classify_transfer_error
+        self.classify = _classify_transfer_error
+
+    def test_allocation_failed(self):
+        assert self.classify("Could not allocate local KV pages for transfer") == "allocation_failed"
+
+    def test_allocation_failed_case_insensitive(self):
+        assert self.classify("could not allocate enough pages") == "allocation_failed"
+
+    def test_timeout(self):
+        assert self.classify("NIXL transfer timeout after 5000ms") == "timeout"
+
+    def test_timeout_case_insensitive(self):
+        assert self.classify("RPC Timeout waiting for response") == "timeout"
+
+    def test_nixl_error(self):
+        assert self.classify("NIXL agent returned error code -1") == "nixl_error"
+
+    def test_nixl_error_case_insensitive(self):
+        assert self.classify("nixl initialization failed") == "nixl_error"
+
+    def test_too_many_pending(self):
+        assert self.classify("Too many pending transfers (32/32)") == "too_many_pending"
+
+    def test_not_initialized(self):
+        assert self.classify("KV transfer not initialized yet") == "not_initialized"
+
+    def test_unknown_error_falls_through(self):
+        assert self.classify("Something completely unexpected happened") == "error"
+
+    def test_empty_string(self):
+        assert self.classify("") == "error"
+
+    def test_priority_timeout_over_nixl(self):
+        """When message contains both 'NIXL' and 'timeout', timeout wins (checked first)."""
+        # "NIXL transfer timeout" contains both keywords; timeout is checked before nixl
+        assert self.classify("NIXL transfer timeout") == "timeout"

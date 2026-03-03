@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rand::Rng;
 
 use super::config::KvRouterConfig;
+use super::transfer_metrics::TransferDecisionMetrics;
 use super::types::{KvSchedulerError, SchedulingRequest};
 use crate::protocols::{
     TransferHint, WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
@@ -270,27 +272,50 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 /// Transfer is chosen when:
 ///   cost_transfer(best_target, best_source) < cost(best_cache_worker)
 ///   AND decode_blocks(best_cache_worker) - decode_blocks(best_target) >= min_queue_advantage
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TransferAwareWorkerSelector {
     pub kv_router_config: KvRouterConfig,
+    pub metrics: Arc<TransferDecisionMetrics>,
+}
+
+impl Default for TransferAwareWorkerSelector {
+    fn default() -> Self {
+        Self {
+            kv_router_config: KvRouterConfig::default(),
+            metrics: Arc::new(TransferDecisionMetrics::new_unregistered()),
+        }
+    }
 }
 
 impl TransferAwareWorkerSelector {
     pub fn new(kv_router_config: Option<KvRouterConfig>) -> Self {
         Self {
             kv_router_config: kv_router_config.unwrap_or_default(),
+            metrics: Arc::new(TransferDecisionMetrics::new_unregistered()),
+        }
+    }
+
+    #[cfg(feature = "metrics")]
+    pub fn with_component(
+        kv_router_config: Option<KvRouterConfig>,
+        component: &dynamo_runtime::component::Component,
+    ) -> Self {
+        Self {
+            kv_router_config: kv_router_config.unwrap_or_default(),
+            metrics: TransferDecisionMetrics::from_component(component),
         }
     }
 
     /// Evaluate whether a cross-worker transfer would be beneficial.
-    /// Returns Some((target, source, transferable_blocks)) if transfer is cheaper.
+    /// Returns Ok((target, source, transferable_blocks, transfer_cost, cache_cost))
+    /// if transfer is cheaper, or Err(reason) explaining why not.
     fn evaluate_transfer(
         &self,
         worker_logits: &HashMap<WorkerWithDpRank, f64>,
         request: &SchedulingRequest,
         block_size: u32,
         overlap_weight: f64,
-    ) -> Option<(WorkerWithDpRank, WorkerWithDpRank, u32)> {
+    ) -> Result<(WorkerWithDpRank, WorkerWithDpRank, u32, f64, f64), &'static str> {
         let cfg = &self.kv_router_config;
         let overlaps = &request.overlaps.scores;
         let decode_blocks = &request.decode_blocks;
@@ -299,10 +324,11 @@ impl TransferAwareWorkerSelector {
         let (&best_cache_worker, &best_cache_overlap) = overlaps
             .iter()
             .filter(|(w, _)| worker_logits.contains_key(w))
-            .max_by_key(|&(_, score)| *score)?;
+            .max_by_key(|&(_, score)| *score)
+            .ok_or("no_overlap")?;
 
         if best_cache_overlap == 0 {
-            return None; // No cached blocks anywhere
+            return Err("no_overlap");// No cached blocks anywhere
         }
 
         let source_decode = *decode_blocks.get(&best_cache_worker).unwrap_or(&0);
@@ -319,19 +345,20 @@ impl TransferAwareWorkerSelector {
                     da.cmp(db)
                 })
             })
-            .map(|(w, _)| *w)?;
+            .map(|(w, _)| *w)
+            .ok_or("no_target")?;
 
         let target_decode = *decode_blocks.get(&best_target).unwrap_or(&0);
         let target_overlap = *overlaps.get(&best_target).unwrap_or(&0);
 
         // Check queue advantage: source must be sufficiently more loaded than target
         if source_decode.saturating_sub(target_decode) < cfg.min_transfer_queue_advantage as usize {
-            return None;
+            return Err("queue_advantage_low");
         }
 
         // Check the target is actually missing blocks the source has
         if target_overlap >= best_cache_overlap {
-            return None;
+            return Err("target_has_cache");
         }
 
         // Compute transferable blocks (capped by max_transfer_blocks)
@@ -350,7 +377,7 @@ impl TransferAwareWorkerSelector {
             + cfg.transfer_cost_weight * transferable as f64;
 
         // Compare with best-cache worker's cost (the default choice)
-        let cache_cost = *worker_logits.get(&best_cache_worker)?;
+        let cache_cost = *worker_logits.get(&best_cache_worker).ok_or("no_overlap")?;
 
         if transfer_cost < cache_cost {
             tracing::info!(
@@ -363,9 +390,9 @@ impl TransferAwareWorkerSelector {
                 transferable,
                 best_cache_worker.worker_id,
             );
-            Some((best_target, best_cache_worker, transferable))
+            Ok((best_target, best_cache_worker, transferable, transfer_cost, cache_cost))
         } else {
-            None
+            Err("not_cheaper")
         }
     }
 }
@@ -399,24 +426,39 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for TransferAwareWorkerSelector {
 
         // Evaluate transfer opportunity
         if self.kv_router_config.enable_kv_transfer {
-            if let Some((target, source, transferable)) =
-                self.evaluate_transfer(&worker_logits, request, block_size, overlap_weight)
-            {
-                log_selection(target, &worker_logits, overlaps, request, workers);
+            match self.evaluate_transfer(&worker_logits, request, block_size, overlap_weight) {
+                Ok((target, source, transferable, transfer_cost, cache_cost)) => {
+                    self.metrics.record_decision("transfer");
+                    self.metrics
+                        .record_transfer_chosen(transferable, transfer_cost, cache_cost);
 
-                return Ok(WorkerSelectionResult {
-                    worker: target,
-                    required_blocks: request_blocks as u64,
-                    overlap_blocks: overlaps.get(&target).copied().unwrap_or(0),
-                    transfer_hint: Some(TransferHint {
-                        source_worker: source,
-                        num_blocks: transferable,
-                    }),
-                });
+                    log_selection(target, &worker_logits, overlaps, request, workers);
+
+                    return Ok(WorkerSelectionResult {
+                        worker: target,
+                        required_blocks: request_blocks as u64,
+                        overlap_blocks: overlaps.get(&target).copied().unwrap_or(0),
+                        transfer_hint: Some(TransferHint {
+                            source_worker: source,
+                            num_blocks: transferable,
+                        }),
+                    });
+                }
+                Err(reason) => {
+                    self.metrics.record_no_transfer_reason(reason);
+                }
             }
+        } else {
+            self.metrics.record_no_transfer_reason("disabled");
         }
 
         // Fall through to default selection (no transfer)
+        self.metrics.record_decision("no_transfer");
+        // Record the best (lowest) logit as the baseline cost
+        if let Some(&best_cost) = worker_logits.values().min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)) {
+            self.metrics.record_no_transfer_cost(best_cost);
+        }
+
         let temperature = request
             .router_config_override
             .as_ref()
@@ -748,5 +790,373 @@ mod tests {
             result[0], worker20,
             "Should handle negative logits correctly"
         );
+    }
+
+    #[test]
+    fn test_transfer_metrics_recorded_on_transfer() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 14);
+
+        let mut request = make_scheduling_request(256, overlaps);
+        request.decode_blocks.insert(w1, 0);
+        request.decode_blocks.insert(w2, 100);
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            overlap_score_weight: 1.0,
+            transfer_cost_weight: 0.1,
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert!(result.transfer_hint.is_some(), "Transfer should be triggered");
+
+        // Verify metrics were recorded
+        let transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["transfer"])
+            .get();
+        assert_eq!(transfer_count, 1, "Should record one transfer decision");
+
+        let no_transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["no_transfer"])
+            .get();
+        assert_eq!(no_transfer_count, 0, "Should not record no_transfer");
+
+        assert_eq!(
+            selector.metrics.blocks_routed_total.get(),
+            14,
+            "Should record 14 blocks routed"
+        );
+
+        assert_eq!(
+            selector.metrics.cost_with_transfer.get_sample_count(),
+            1,
+            "Should record cost_with_transfer"
+        );
+        assert_eq!(
+            selector.metrics.cost_without_transfer.get_sample_count(),
+            1,
+            "Should record cost_without_transfer"
+        );
+        assert_eq!(
+            selector.metrics.transfer_advantage.get_sample_count(),
+            1,
+            "Should record transfer_advantage"
+        );
+    }
+
+    #[test]
+    fn test_transfer_metrics_recorded_on_no_transfer() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        // No cache = no transfer opportunity
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 0);
+
+        let mut request = make_scheduling_request(256, overlaps);
+        request.decode_blocks.insert(w1, 0);
+        request.decode_blocks.insert(w2, 100);
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert!(result.transfer_hint.is_none());
+
+        let no_transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["no_transfer"])
+            .get();
+        assert_eq!(no_transfer_count, 1, "Should record no_transfer decision");
+
+        let transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["transfer"])
+            .get();
+        assert_eq!(transfer_count, 0, "Should not record transfer");
+
+        // cost_without_transfer should be recorded as baseline
+        assert_eq!(
+            selector.metrics.cost_without_transfer.get_sample_count(),
+            1,
+            "Should record baseline cost"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_disabled() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 10);
+
+        let request = make_scheduling_request(256, overlaps);
+
+        // Transfer disabled
+        let config = KvRouterConfig {
+            enable_kv_transfer: false,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["disabled"]).get(),
+            1,
+            "Should record 'disabled' reason when transfer is not enabled"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_no_overlap() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        // No cache on either worker
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 0);
+
+        let mut request = make_scheduling_request(256, overlaps);
+        request.decode_blocks.insert(w1, 0);
+        request.decode_blocks.insert(w2, 100);
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["no_overlap"]).get(),
+            1,
+            "Should record 'no_overlap' reason when no blocks are cached"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_queue_advantage_low() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 14);
+
+        let mut request = make_scheduling_request(256, overlaps);
+        // Queues are similar (difference < min_transfer_queue_advantage=8)
+        request.decode_blocks.insert(w1, 5);
+        request.decode_blocks.insert(w2, 10);
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            overlap_score_weight: 1.0,
+            transfer_cost_weight: 0.1,
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["queue_advantage_low"]).get(),
+            1,
+            "Should record 'queue_advantage_low' when queue delta is below threshold"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_not_cheaper() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        // w2 has some cache, but transfer cost weight is very high
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 0);
+        overlaps.insert(w2, 4); // small overlap
+
+        let mut request = make_scheduling_request(256, overlaps);
+        request.decode_blocks.insert(w1, 0);
+        request.decode_blocks.insert(w2, 20); // moderate queue difference
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            overlap_score_weight: 1.0,
+            transfer_cost_weight: 100.0, // absurdly high — transfer never wins
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["not_cheaper"]).get(),
+            1,
+            "Should record 'not_cheaper' when transfer cost exceeds cache cost"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_no_target_single_worker() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+
+        // Single worker with some cache
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 10);
+
+        let request = make_scheduling_request(256, overlaps);
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["no_target"]).get(),
+            1,
+            "Should record 'no_target' when only one worker is available"
+        );
+    }
+
+    #[test]
+    fn test_no_transfer_reason_target_has_cache() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        // Both workers have equal cache — target already has everything source has
+        let mut overlaps = rustc_hash::FxHashMap::default();
+        overlaps.insert(w1, 10);
+        overlaps.insert(w2, 10);
+
+        let mut request = make_scheduling_request(256, overlaps);
+        request.decode_blocks.insert(w1, 0);
+        request.decode_blocks.insert(w2, 100); // w2 is heavily loaded
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            overlap_score_weight: 1.0,
+            transfer_cost_weight: 0.1,
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+        let _result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(
+            selector.metrics.no_transfer_reasons.with_label_values(&["target_has_cache"]).get(),
+            1,
+            "Should record 'target_has_cache' when target has >= source's overlap"
+        );
+    }
+
+    #[test]
+    fn test_transfer_metrics_multiple_decisions() {
+        let w1 = WorkerWithDpRank::from_worker_id(1);
+        let w2 = WorkerWithDpRank::from_worker_id(2);
+
+        let mut workers: HashMap<u64, SimpleWorkerConfig> = HashMap::new();
+        workers.insert(1, SimpleWorkerConfig::default());
+        workers.insert(2, SimpleWorkerConfig::default());
+
+        let config = KvRouterConfig {
+            enable_kv_transfer: true,
+            overlap_score_weight: 1.0,
+            transfer_cost_weight: 0.1,
+            min_transfer_queue_advantage: 8,
+            max_transfer_blocks: 256,
+            ..Default::default()
+        };
+        let selector = TransferAwareWorkerSelector::new(Some(config));
+
+        // First request: triggers transfer (w2 has cache, w1 is empty)
+        let mut overlaps1 = rustc_hash::FxHashMap::default();
+        overlaps1.insert(w1, 0);
+        overlaps1.insert(w2, 14);
+        let mut req1 = make_scheduling_request(256, overlaps1);
+        req1.decode_blocks.insert(w1, 0);
+        req1.decode_blocks.insert(w2, 100);
+        let r1 = selector.select_worker(&workers, &req1, 16).unwrap();
+        assert!(r1.transfer_hint.is_some());
+
+        // Second request: no transfer (no cache)
+        let mut overlaps2 = rustc_hash::FxHashMap::default();
+        overlaps2.insert(w1, 0);
+        overlaps2.insert(w2, 0);
+        let mut req2 = make_scheduling_request(128, overlaps2);
+        req2.decode_blocks.insert(w1, 0);
+        req2.decode_blocks.insert(w2, 50);
+        let r2 = selector.select_worker(&workers, &req2, 16).unwrap();
+        assert!(r2.transfer_hint.is_none());
+
+        // Verify cumulative metrics
+        let transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["transfer"])
+            .get();
+        let no_transfer_count = selector
+            .metrics
+            .decisions_total
+            .with_label_values(&["no_transfer"])
+            .get();
+        assert_eq!(transfer_count, 1);
+        assert_eq!(no_transfer_count, 1);
     }
 }

@@ -54,6 +54,23 @@ class KvTransferSourceHandler:
             num_blocks = request.get("num_blocks", 0)
             result = self._query_blocks_cached(token_ids, num_blocks)
             record_transfer_request("source", "success")
+            if result.get("status") == "ok":
+                matched = result.get("num_matched_blocks", 0)
+                bpb = getattr(self.manager, "bytes_per_block", 0) or 0
+                if isinstance(bpb, int) and bpb > 0:
+                    from dynamo.sglang.kv_transfer.metrics import (
+                        record_transfer_bytes,
+                    )
+
+                    record_transfer_bytes("source", matched * bpb)
+                logging.info(
+                    f"Source served {matched} blocks for transfer",
+                    extra={
+                        "event": "kv_transfer_source_served",
+                        "num_blocks": matched,
+                        "action": "query_blocks",
+                    },
+                )
         else:
             result = {"status": "error", "message": f"Unknown action: {action}"}
             record_transfer_request("source", "failed")

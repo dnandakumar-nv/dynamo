@@ -206,13 +206,23 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                                         f"Failed to publish transfer KV events: {pub_err}"
                                     )
                         else:
-                            logging.debug(
+                            logging.info(
                                 f"KV transfer skipped ({transfer_result.error}), "
-                                f"proceeding with full prefill"
+                                f"proceeding with full prefill",
+                                extra={
+                                    "event": "kv_transfer_skipped",
+                                    "reason": str(transfer_result.error),
+                                    "result": "fallback_to_prefill",
+                                },
                             )
                     except Exception as e:
-                        logging.debug(
-                            f"KV transfer error ({e}), proceeding with full prefill"
+                        logging.info(
+                            f"KV transfer error ({e}), proceeding with full prefill",
+                            extra={
+                                "event": "kv_transfer_failed",
+                                "error": str(e),
+                                "result": "fallback_to_prefill",
+                            },
                         )
                 else:
                     logging.debug(

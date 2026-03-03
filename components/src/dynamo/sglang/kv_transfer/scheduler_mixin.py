@@ -143,11 +143,20 @@ def install_kv_transfer_methods(scheduler_class):
             f"KV Transfer socket bound: ipc://{ipc_path} (rank {tp_rank})"
         )
 
+        # Compute bytes_per_block for transfer metrics.
+        # sum(item_lens) gives total bytes per token across all KV buffers;
+        # multiply by page_size to get bytes per block.
+        self._bytes_per_block = sum(self._kv_item_lens) * page_size
+
         # Write IPC path to result_file for main process to read
         if result_file:
             rank_file = f"{result_file}.rank{tp_rank}"
             with open(rank_file, "w") as f:
-                json.dump({"status": "ok", "ipc_path": ipc_path}, f)
+                json.dump({
+                    "status": "ok",
+                    "ipc_path": ipc_path,
+                    "bytes_per_block": self._bytes_per_block,
+                }, f)
 
     def get_kv_transfer_metadata(self, result_file=None):
         """Return this worker's NIXL metadata + KV layout for remote workers.
@@ -494,11 +503,24 @@ def install_kv_transfer_methods(scheduler_class):
                     )
                 time.sleep(0.0001)  # 100us poll interval
             t_done = time.time_ns()
+            rdma_seconds = (t_done - t_prep) / 1e9
             logger.info(
                 f"NIXL timing: {num_descs} descs, "
                 f"prep={(t_prep - t0) / 1e6:.1f}ms "
-                f"rdma={(t_done - t_prep) / 1e6:.1f}ms"
+                f"rdma={rdma_seconds * 1000:.1f}ms"
             )
+            try:
+                from dynamo.sglang.kv_transfer.metrics import (
+                    record_nixl_read_op,
+                )
+
+                rdma_byte_count = (
+                    num_blocks * getattr(self, "_bytes_per_block", 0)
+                )
+                if rdma_byte_count > 0:
+                    record_nixl_read_op(rdma_byte_count, rdma_seconds)
+            except Exception:
+                pass
 
         finally:
             if xfer_handle is not None:
@@ -715,6 +737,16 @@ def install_kv_transfer_methods(scheduler_class):
             f"{state['num_blocks']} blocks, prep={state['prep_ms']:.1f}ms "
             f"rdma={rdma_ms:.1f}ms"
         )
+        try:
+            from dynamo.sglang.kv_transfer.metrics import record_nixl_read_op
+
+            rdma_byte_count = (
+                state["num_blocks"] * getattr(self, "_bytes_per_block", 0)
+            )
+            if rdma_byte_count > 0:
+                record_nixl_read_op(rdma_byte_count, rdma_ms / 1000.0)
+        except Exception:
+            pass
 
         # Write completion file (atomic rename to prevent partial reads)
         completion_file = state.get("completion_file")

@@ -15,6 +15,26 @@ import time
 from typing import Any, Dict, List, Optional
 
 
+def _classify_transfer_error(error_msg: str) -> str:
+    """Classify a transfer exception message into a reason label for metrics.
+
+    Maps known error patterns to specific reason labels so Prometheus/Grafana
+    can show a breakdown instead of a generic "error" bucket.
+    """
+    msg_lower = error_msg.lower()
+    if "could not allocate" in msg_lower:
+        return "allocation_failed"
+    if "timeout" in msg_lower:
+        return "timeout"
+    if "nixl" in msg_lower:
+        return "nixl_error"
+    if "too many pending" in msg_lower:
+        return "too_many_pending"
+    if "not initialized" in msg_lower:
+        return "not_initialized"
+    return "error"
+
+
 class TransferResult:
     """Result of a KV transfer attempt."""
 
@@ -118,6 +138,15 @@ class KvTransferTargetHandler:
         try:
             transfer_start = time.monotonic()
 
+            logging.info(
+                "KV transfer initiated",
+                extra={
+                    "event": "kv_transfer_initiated",
+                    "source_worker": source_worker_id,
+                    "num_hint_blocks": num_blocks,
+                },
+            )
+
             # Trim token_ids to only the prefix needed for transfer.
             # Avoids serializing thousands of extra tokens through RPCs.
             page_size = self.manager.page_size
@@ -194,6 +223,7 @@ class KvTransferTargetHandler:
 
             from dynamo.sglang.kv_transfer.metrics import (
                 record_transfer_blocks,
+                record_transfer_bytes,
                 record_transfer_duration,
                 record_transfer_request,
             )
@@ -201,12 +231,27 @@ class KvTransferTargetHandler:
             record_transfer_request("target", "success")
             record_transfer_blocks("target", actual_blocks)
             record_transfer_duration("target", transfer_elapsed)
+            bpb = getattr(self.manager, "bytes_per_block", 0) or 0
+            if isinstance(bpb, int) and bpb > 0:
+                record_transfer_bytes("target", actual_blocks * bpb)
 
+            elapsed_ms = transfer_elapsed * 1000
+            lookup_ms = (t_lookup - transfer_start) * 1000
+            rdma_ms = (t_transfer - t_lookup) * 1000
             logging.info(
-                f"KV transfer: {actual_blocks} blocks "
-                f"({transferred_tokens} tokens) in {transfer_elapsed * 1000:.1f}ms "
-                f"[lookup={(t_lookup - transfer_start) * 1000:.0f}ms "
-                f"rdma={(t_transfer - t_lookup) * 1000:.0f}ms]"
+                f"KV transfer completed: {actual_blocks} blocks "
+                f"({transferred_tokens} tokens) in {elapsed_ms:.1f}ms "
+                f"[lookup={lookup_ms:.0f}ms rdma={rdma_ms:.0f}ms]",
+                extra={
+                    "event": "kv_transfer_completed",
+                    "source_worker": source_worker_id,
+                    "num_blocks": actual_blocks,
+                    "transferred_tokens": transferred_tokens,
+                    "elapsed_ms": round(elapsed_ms, 2),
+                    "lookup_ms": round(lookup_ms, 2),
+                    "rdma_ms": round(rdma_ms, 2),
+                    "result": "success",
+                },
             )
             return TransferResult.succeeded(actual_blocks, transferred_tokens)
 
@@ -217,9 +262,15 @@ class KvTransferTargetHandler:
             )
 
             record_transfer_request("target", "failed")
-            record_transfer_fallback("error")
+            record_transfer_fallback(_classify_transfer_error(str(e)))
             logging.warning(
-                f"KV transfer failed, falling back to full prefill: {e}"
+                f"KV transfer failed, falling back to full prefill: {e}",
+                extra={
+                    "event": "kv_transfer_failed",
+                    "source_worker": source_worker_id,
+                    "error": str(e),
+                    "result": "fallback_to_prefill",
+                },
             )
             return TransferResult.failed(str(e))
 

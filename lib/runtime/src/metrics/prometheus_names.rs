@@ -479,6 +479,15 @@ pub mod router {
 pub mod kvrouter {
     /// Number of KV cache events applied to the index (including status)
     pub const KV_CACHE_EVENTS_APPLIED: &str = "kv_cache_events_applied";
+
+    // Phase 6: Transfer decision metrics
+    pub const TRANSFER_DECISIONS_TOTAL: &str = "transfer_decisions_total";
+    pub const TRANSFER_BLOCKS_ROUTED_TOTAL: &str = "transfer_blocks_routed_total";
+    pub const TRANSFER_ESTIMATED_MS: &str = "transfer_estimated_ms";
+    pub const COST_WITH_TRANSFER: &str = "cost_with_transfer";
+    pub const COST_WITHOUT_TRANSFER: &str = "cost_without_transfer";
+    pub const TRANSFER_ADVANTAGE: &str = "transfer_advantage";
+    pub const NO_TRANSFER_REASONS_TOTAL: &str = "no_transfer_reasons_total";
 }
 
 /// Block access metrics emitted by the KV indexer when processing BlockAccessed events.
